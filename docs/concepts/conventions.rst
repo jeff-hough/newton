@@ -21,7 +21,7 @@ Shifting the reference point by :math:`\mathbf{r} = (\mathbf{p}_{\text{new}} - \
 
 .. math::
 
-   \boldsymbol{\tau}_{\text{new}} = \boldsymbol{\tau} + \mathbf{r} \times \mathbf{f}, \qquad
+   \boldsymbol{\tau}_{\text{new}} = \boldsymbol{\tau} - \mathbf{r} \times \mathbf{f}, \qquad
    \mathbf{v}_{\text{new}} = \mathbf{v} + \boldsymbol{\omega} \times \mathbf{r}.
 
 Keep this distinction in mind below: In addition to the coordinate frame that wrenches and twists are expressed in,
@@ -261,11 +261,11 @@ frame as:
 where :math:`\mathbf{f}` is the **linear force** and :math:`\boldsymbol{\tau}`
 is the **moment about the body's center of mass (COM)**, both expressed in
 world coordinates. The reference point matters for the moment term, so shifting
-the wrench to a point offset by :math:`\mathbf{r}` changes the torque as:
+the wrench reference by :math:`\mathbf{r} = (\mathbf{p}_{\text{new}} - \mathbf{p}_{\text{old}})` changes the torque as:
 
 .. math::
 
-   \boldsymbol{\tau}_{\text{new}} = \boldsymbol{\tau} + \mathbf{r} \times \mathbf{f}.
+   \boldsymbol{\tau}_{\text{new}} = \boldsymbol{\tau} - \mathbf{r} \times \mathbf{f}.
 
 This convention is used in all Newton solvers.
 
