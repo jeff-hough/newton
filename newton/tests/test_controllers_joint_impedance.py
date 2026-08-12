@@ -37,7 +37,7 @@ def _flat(data, device):
 
 
 def _build_single_prismatic():
-    """Build a one-robot, one-DOF prismatic-joint ModelBuilder."""
+    """Build a finalized one-robot, one-DOF prismatic-joint model."""
     builder = newton.ModelBuilder()
     link = builder.add_link()
     j = builder.add_joint_prismatic(
@@ -48,11 +48,11 @@ def _build_single_prismatic():
         child_xform=wp.transform_identity(),
     )
     builder.add_articulation([j], label="robot")
-    return builder
+    return builder.finalize()
 
 
 def _build_two_robot_mixed():
-    """Build a ModelBuilder with robot 0 (2 revolute DOFs) and robot 1 (1 prismatic DOF)."""
+    """Build a finalized model with robot 0 (2 revolute DOFs) and robot 1 (1 prismatic DOF)."""
     builder = newton.ModelBuilder()
     # Robot 0: 2-DOF revolute chain
     l0a = builder.add_link()
@@ -82,7 +82,7 @@ def _build_two_robot_mixed():
         child_xform=wp.transform_identity(),
     )
     builder.add_articulation([j1], label="robot1")
-    return builder
+    return builder.finalize()
 
 
 def _make_mf(
@@ -648,16 +648,15 @@ class TestControllerJointImpedanceModelFreeHeterogeneous(unittest.TestCase):
 class TestControllerJointImpedance(unittest.TestCase):
     def _make_ctrl(self, device, *, kp=10.0, kd=1.0, use_inertia=False):
         """Build a ControllerJointImpedance for a single prismatic robot."""
-        builder = _build_single_prismatic()
+        model = _build_single_prismatic()
         return ControllerJointImpedance(
-            builder=builder,
+            model,
             default_dof_indices=_iota(1, device),
             stiffness=_gains(1, 1, kp, device),
             damping=_gains(1, 1, kd, device),
             use_gravity_compensation=False,
             use_coriolis_compensation=False,
             use_inertia_decoupling=use_inertia,
-            device=device,
         )
 
     def _run(self, ctrl, *, q_sim, qd_sim, q_des_sim, qd_des_sim, device):
@@ -710,15 +709,15 @@ class TestControllerJointImpedance(unittest.TestCase):
             child_xform=wp.transform_identity(),
         )
         builder.add_articulation([j], label="ball_robot")
+        model = builder.finalize()
         with self.assertRaises(ValueError):
             ControllerJointImpedance(
-                builder=builder,
+                model,
                 default_dof_indices=_iota(3, device),
                 stiffness=_gains(1, 3, 1.0, device),
                 damping=_gains(1, 3, 0.0, device),
                 use_gravity_compensation=False,
                 use_coriolis_compensation=False,
-                device=device,
             )
 
     def test_fixed_joint_allowed(self):
@@ -741,77 +740,144 @@ class TestControllerJointImpedance(unittest.TestCase):
             child_xform=wp.transform_identity(),
         )
         builder.add_articulation([j_fixed, j_rev], label="robot")
+        model = builder.finalize()
         # Should not raise — fixed joint is zero-DOF and irrelevant to the PD term.
         ctrl = ControllerJointImpedance(
-            builder=builder,
+            model,
             default_dof_indices=_iota(1, device),
             stiffness=_gains(1, 1, 10.0, device),
             damping=_gains(1, 1, 1.0, device),
             use_gravity_compensation=False,
             use_coriolis_compensation=False,
-            device=device,
         )
         self.assertIsNotNone(ctrl)
 
-    def test_builder_reusable_after_construction(self):
-        """Verify construction snapshots the builder rather than consuming or modifying it.
+    def test_model_is_borrowed_not_copied(self):
+        """Verify the controller holds the caller's model rather than building its own.
 
-        The controller finalizes ``builder`` into a private model. That must
-        leave the caller's builder untouched and still independently usable, so
-        the same topology can also be built into the simulated model.
+        Construction takes a finalized model and must not duplicate or replace it,
+        so runtime changes to the model are visible to the controller.
         """
         device = wp.get_device()
-        builder = _build_single_prismatic()
-        before = (builder.articulation_count, builder.joint_dof_count, list(builder.joint_type))
-
-        ControllerJointImpedance(
-            builder,
+        model = _build_single_prismatic()
+        ctrl = ControllerJointImpedance(
+            model,
             default_dof_indices=_iota(1, device),
             stiffness=_gains(1, 1, 10.0, device),
             damping=_gains(1, 1, 1.0, device),
             use_gravity_compensation=False,
             use_coriolis_compensation=False,
             use_inertia_decoupling=False,
-            device=device,
         )
+        self.assertIs(ctrl._model, model)
+        self.assertEqual(ctrl.device, model.device)
 
-        after = (builder.articulation_count, builder.joint_dof_count, list(builder.joint_type))
-        self.assertEqual(before, after, "constructing the controller modified the builder")
+    def test_model_with_unarticulated_dof_raises(self):
+        """Verify a model containing a movable joint outside any articulation is rejected.
 
-        # Snapshotted, not consumed: the builder can still be finalized on its own.
-        model = builder.finalize(device=device)
-        self.assertEqual(model.articulation_count, 1)
-        self.assertEqual(model.joint_dof_count, 1)
+        Such a joint would never receive a value, so eval_fk would run on a stale
+        pose — and if it sits upstream of an articulation, on a wrong base
+        transform. Neither is recoverable, so it is refused at construction.
+        """
+        device = wp.get_device()
+        builder = newton.ModelBuilder()
+        # A "door": a prismatic joint belonging to no articulation.
+        door = builder.add_link()
+        builder.add_joint_prismatic(
+            parent=-1,
+            child=door,
+            axis=wp.vec3(1.0, 0.0, 0.0),
+            parent_xform=wp.transform_identity(),
+            child_xform=wp.transform_identity(),
+        )
+        arm = builder.add_link()
+        j = builder.add_joint_revolute(
+            parent=-1,
+            child=arm,
+            axis=wp.vec3(0.0, 0.0, 1.0),
+            parent_xform=wp.transform_identity(),
+            child_xform=wp.transform_identity(),
+        )
+        builder.add_articulation([j], label="robot")
+        model = builder.finalize()
+
+        with self.assertRaises(ValueError) as ctx:
+            ControllerJointImpedance(
+                model,
+                default_dof_indices=_iota(1, device),
+                stiffness=_gains(1, 1, 10.0, device),
+                damping=_gains(1, 1, 0.0, device),
+                use_gravity_compensation=False,
+                use_coriolis_compensation=False,
+                use_inertia_decoupling=False,
+            )
+        self.assertIn("belong to articulations", str(ctx.exception))
+
+    def test_model_with_stray_fixed_joint_accepted(self):
+        """Verify a zero-DOF joint outside any articulation does not trip the DOF check.
+
+        Ground planes and rigid welds contribute no DOFs, so the check must not
+        reject them.
+        """
+        device = wp.get_device()
+        builder = newton.ModelBuilder()
+        arm = builder.add_link()
+        j = builder.add_joint_revolute(
+            parent=-1,
+            child=arm,
+            axis=wp.vec3(0.0, 0.0, 1.0),
+            parent_xform=wp.transform_identity(),
+            child_xform=wp.transform_identity(),
+        )
+        builder.add_articulation([j], label="robot")
+        weld = builder.add_link()
+        builder.add_joint_fixed(
+            parent=-1,
+            child=weld,
+            parent_xform=wp.transform_identity(),
+            child_xform=wp.transform_identity(),
+        )
+        builder.add_ground_plane()
+        model = builder.finalize()
+
+        ctrl = ControllerJointImpedance(
+            model,
+            default_dof_indices=_iota(1, device),
+            stiffness=_gains(1, 1, 10.0, device),
+            damping=_gains(1, 1, 0.0, device),
+            use_gravity_compensation=False,
+            use_coriolis_compensation=False,
+            use_inertia_decoupling=False,
+        )
+        self.assertIsNotNone(ctrl)
 
     def test_wrong_index_length_raises(self):
         """Verify that a mismatched default_dof_indices length raises ValueError."""
         device = wp.get_device()
-        builder = _build_single_prismatic()
+        model = _build_single_prismatic()
         with self.assertRaises(ValueError):
             ControllerJointImpedance(
-                builder=builder,
+                model,
                 default_dof_indices=_iota(5, device),
                 stiffness=_gains(1, 1, 1.0, device),
                 damping=_gains(1, 1, 0.0, device),
                 use_gravity_compensation=False,
                 use_coriolis_compensation=False,
-                device=device,
             )
 
     def test_2d_default_dof_indices_raises(self):
         """Verify a 2-D default_dof_indices raises even when its total element count matches."""
         device = wp.get_device()
-        builder = _build_single_prismatic()
+        model = _build_single_prismatic()
         indices_2d = wp.array(np.arange(1, dtype=np.uint32).reshape(1, 1), dtype=wp.uint32, device=device)
         with self.assertRaises(ValueError):
             ControllerJointImpedance(
-                builder=builder,
+                model,
                 default_dof_indices=indices_2d,
                 stiffness=_gains(1, 1, 1.0, device),
                 damping=_gains(1, 1, 0.0, device),
                 use_gravity_compensation=False,
                 use_coriolis_compensation=False,
-                device=device,
             )
 
     def test_short_joint_q_raises_before_gather(self):
@@ -846,17 +912,16 @@ class TestControllerJointImpedance(unittest.TestCase):
     def test_heterogeneous_model(self):
         """Verify model-based controller works with a heterogeneous two-robot fleet."""
         device = wp.get_device()
-        builder = _build_two_robot_mixed()  # robot0: 2 DOFs, robot1: 1 DOF
+        model = _build_two_robot_mixed()  # robot0: 2 DOFs, robot1: 1 DOF
         max_dofs = 2
         ctrl = ControllerJointImpedance(
-            builder=builder,
+            model,
             default_dof_indices=_iota(3, device),  # 2 + 1 total DOFs
             stiffness=_gains(2, max_dofs, 4.0, device),
             damping=_gains(2, max_dofs, 0.0, device),
             use_gravity_compensation=False,
             use_coriolis_compensation=False,
             use_inertia_decoupling=False,
-            device=device,
         )
         ins = ctrl.input()
         ins.joint_q = wp.zeros(3, dtype=wp.float32, device=device)

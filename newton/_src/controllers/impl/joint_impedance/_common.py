@@ -62,11 +62,12 @@ def _mass_matrix_multiply_kernel(
 @wp.kernel
 def _gather_dof_flat_kernel(
     src: wp.array[wp.float32],  # flat sim array
-    indices: wp.array[wp.uint32],  # (total_dofs,) — concatenated per-robot, no padding
-    dst: wp.array[wp.float32],  # flat output (total_dofs,)
+    src_indices: wp.array[wp.uint32],  # (total_dofs,) — controller slot -> sim slot
+    dst_indices: wp.array[wp.uint32],  # (total_dofs,) — controller slot -> model DOF slot
+    dst: wp.array[wp.float32],  # flat model array
 ):
     flat = wp.tid()
-    dst[flat] = src[indices[flat]]
+    dst[dst_indices[flat]] = src[src_indices[flat]]
 
 
 @wp.kernel

@@ -4,24 +4,23 @@
 """ControllerJointImpedance — joint-space impedance control with
 Newton model-internal dynamics.
 
-Internally calls :func:`newton.eval_fk` and :func:`newton.eval_mass_matrix`
-each step to obtain the mass matrix, then delegates all gather/compute/scatter
-work to an inner :class:`ControllerJointImpedanceModelFree` instance.
+Calls :func:`newton.eval_fk` and :func:`newton.eval_mass_matrix` on the supplied
+model each step to obtain the mass matrix, then delegates all
+gather/compute/scatter work to an inner
+:class:`ControllerJointImpedanceModelFree` instance.
 
 Gravity and Coriolis compensation use :func:`newton.eval_inverse_dynamics_passive`.
 """
 
 from __future__ import annotations
 
-from typing import Any
-
 import numpy as np
 import warp as wp
 
 from newton import JointType
 from newton._src.sim.articulation import eval_fk, eval_mass_matrix
-from newton._src.sim.builder import ModelBuilder
 from newton._src.sim.inverse_dynamics import eval_inverse_dynamics_passive
+from newton._src.sim.model import Model
 
 from ...controller import ControllerBase
 from ...utils import _normalize_indices, _validate_array, _validate_flat_port
@@ -33,17 +32,18 @@ class ControllerJointImpedance(ControllerBase):
     """Joint-space impedance controller with internally computed dynamics.
 
     Implements the joint-space impedance control law. This model-based variant
-    computes the mass matrix, gravity, and Coriolis terms itself: it holds a
-    private :class:`~newton.Model` built from ``builder`` and evaluates forward
-    kinematics and the enabled dynamics terms on every :meth:`step`, so the
-    caller supplies only joint positions and velocities.
+    computes the mass matrix, gravity, and Coriolis terms itself: it evaluates
+    forward kinematics and the enabled dynamics terms from ``model`` on every
+    :meth:`step`, so the caller supplies only joint positions and velocities.
 
-    ``builder`` is not modified at construction — and the internal :class:`newton.Model` cannot be rebuilt after construction. Later changes to ``builder`` or
-    to the simulated model do not propagate, so a mismatched topology computes
-    dynamics for a different robot with no diagnostic.
+    Pass exactly the model you intend to control, not the full simulation model.
+    Every DOF in ``model`` must belong to one of its articulations; a model
+    containing other movable joints is rejected at construction. ``model`` is
+    borrowed, not owned — it is never written to, and changes to it are visible
+    to the controller immediately.
 
     Supports heterogeneous robot fleets — robots in the batch may have
-    different DOF counts. The ``builder`` articulations define the
+    different DOF counts. The ``model`` articulations define the
     per-robot topology; the controller pads internal buffers to
     ``model.max_dofs_per_articulation`` and skips padding slots in all kernels.
 
@@ -62,8 +62,9 @@ class ControllerJointImpedance(ControllerBase):
             + [g(q)      if use_gravity_compensation  else 0]
 
     Args:
-        builder: :class:`~newton.ModelBuilder` with N articulations (one
-            per robot). Articulations may have different DOF counts.
+        model: :class:`~newton.Model` with N articulations (one per robot).
+            Articulations may have different DOF counts, but every DOF in the
+            model must belong to one of them.
         default_dof_indices: Concatenated per-robot index arrays of length
             ``sum(dofs per articulation)`` mapping controller DOF slots to
             positions in the flat simulation arrays (robot 0's indices first,
@@ -89,7 +90,6 @@ class ControllerJointImpedance(ControllerBase):
         joint_qdd_idx: Optional index array for feedforward read.
         joint_f_idx: Optional index array overriding ``default_dof_indices``
             for the torque-output write.
-        device: Warp device.
         requires_grad: Whether internal buffers need gradient support.
     """
 
@@ -123,7 +123,7 @@ class ControllerJointImpedance(ControllerBase):
 
     def __init__(
         self,
-        builder: ModelBuilder,
+        model: Model,
         *,
         default_dof_indices: wp.array[wp.uint32],
         stiffness: wp.array2d[wp.float32] | None,
@@ -138,20 +138,19 @@ class ControllerJointImpedance(ControllerBase):
         joint_qd_des_idx: wp.array[wp.uint32] | None = None,
         joint_qdd_idx: wp.array[wp.uint32] | None = None,
         joint_f_idx: wp.array[wp.uint32] | None = None,
-        device: Any = None,
         requires_grad: bool = False,
     ):
-        if not isinstance(builder, ModelBuilder):
-            raise TypeError(f"builder must be a newton.ModelBuilder, got {type(builder).__name__}.")
-        robot_count = builder.articulation_count
+        if not isinstance(model, Model):
+            raise TypeError(f"model must be a newton.Model, got {type(model).__name__}.")
+        robot_count = model.articulation_count
         if robot_count < 1:
-            raise ValueError("builder has no articulations.")
+            raise ValueError("model has no articulations.")
 
         # Fixed joints contribute zero DOFs and are invisible to the PD error term.
         allowed_joint_types = {int(JointType.REVOLUTE), int(JointType.PRISMATIC), int(JointType.FIXED)}
         unsupported_joints = [
             (joint_index, JointType(joint_type).name)
-            for joint_index, joint_type in enumerate(builder.joint_type)
+            for joint_index, joint_type in enumerate(model.joint_type.numpy())
             if joint_type not in allowed_joint_types
         ]
         if unsupported_joints:
@@ -160,7 +159,7 @@ class ControllerJointImpedance(ControllerBase):
                 f"zero-DOF fixed joints; found unsupported joint types: {unsupported_joints}"
             )
 
-        self._device = wp.get_device(device)
+        self._device = model.device
         self._requires_grad = requires_grad
         self._use_gravity = bool(use_gravity_compensation)
         self._use_coriolis = bool(use_coriolis_compensation)
@@ -170,21 +169,40 @@ class ControllerJointImpedance(ControllerBase):
         self._stiffness_is_live = stiffness is None
         self._damping_is_live = damping is None
 
-        self._model = builder.finalize(device=self._device, requires_grad=requires_grad)
-        self._model_state = self._model.state()
+        self._model = model
+        self._model_state = model.state()
 
-        max_dofs = self._model.max_dofs_per_articulation
+        max_dofs = model.max_dofs_per_articulation
 
-        # Derive per-articulation DOF counts from the finalized model.
-        art_start = self._model.articulation_start.numpy()
-        art_end = self._model.articulation_end.numpy()
-        joint_q_start = self._model.joint_q_start.numpy()
+        # Per-articulation DOF counts, and where each controller DOF lives in the
+        # model's flat joint arrays. Both derive from the same three model arrays,
+        # so they cannot disagree.
+        art_start = model.articulation_start.numpy()
+        art_end = model.articulation_end.numpy()
+        joint_q_start = model.joint_q_start.numpy()
         dofs_per_robot_np = np.array(
             [joint_q_start[art_end[i]] - joint_q_start[art_start[i]] for i in range(robot_count)],
             dtype=np.int32,
         )
         dofs_per_robot = wp.array(dofs_per_robot_np, dtype=wp.int32, device=self._device)
         total_dofs = int(dofs_per_robot_np.sum())
+
+        # Every model DOF must belong to a controlled articulation. A joint outside
+        # them would never receive a value, so eval_fk would run on a stale pose —
+        # and if it sits upstream of an articulation, on a wrong base transform.
+        if total_dofs != model.joint_dof_count:
+            raise ValueError(
+                f"model has {model.joint_dof_count} DOFs but only {total_dofs} belong to articulations; "
+                f"pass a model containing exactly the articulations to control."
+            )
+
+        model_dof_indices = np.concatenate(
+            [
+                np.arange(joint_q_start[art_start[i]], joint_q_start[art_start[i]] + dofs_per_robot_np[i])
+                for i in range(robot_count)
+            ]
+        ).astype(np.uint32)
+        self._model_dof_indices = wp.array(model_dof_indices, dtype=wp.uint32, device=self._device)
 
         # ------------------------------------------------------------------
         # Validation: every wp.array argument is checked here, and nowhere
@@ -241,9 +259,6 @@ class ControllerJointImpedance(ControllerBase):
                 total_dofs, dtype=wp.float32, device=self._device, requires_grad=requires_grad
             )
 
-        # Newton fills dynamics in the same DOF order as model.joint_q — use identity indices.
-        identity_idx = wp.array(np.arange(total_dofs, dtype=np.uint32), device=self._device)
-
         self._model_free = ControllerJointImpedanceModelFree(
             dofs_per_robot=dofs_per_robot,
             default_dof_indices=default_dof_indices,
@@ -258,10 +273,10 @@ class ControllerJointImpedance(ControllerBase):
             joint_q_des_idx=joint_q_des_idx,
             joint_qd_des_idx=joint_qd_des_idx,
             joint_qdd_idx=joint_qdd_idx,
-            gravity_force_idx=identity_idx,
-            coriolis_force_idx=identity_idx,
+            gravity_force_idx=self._model_dof_indices,
+            coriolis_force_idx=self._model_dof_indices,
             joint_f_idx=joint_f_idx,
-            device=device,
+            device=self._device,
             requires_grad=requires_grad,
         )
 
@@ -346,14 +361,14 @@ class ControllerJointImpedance(ControllerBase):
         wp.launch(
             _gather_dof_flat_kernel,
             dim=self._total_dofs,
-            inputs=[inputs.joint_q, self._q_idx],
+            inputs=[inputs.joint_q, self._q_idx, self._model_dof_indices],
             outputs=[self._model_state.joint_q],
             device=self._device,
         )
         wp.launch(
             _gather_dof_flat_kernel,
             dim=self._total_dofs,
-            inputs=[inputs.joint_qd, self._qd_idx],
+            inputs=[inputs.joint_qd, self._qd_idx, self._model_dof_indices],
             outputs=[self._model_state.joint_qd],
             device=self._device,
         )

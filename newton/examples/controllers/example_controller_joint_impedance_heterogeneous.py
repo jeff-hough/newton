@@ -119,16 +119,9 @@ class Example:
         self.viewer = viewer
         self.device = wp.get_device()
 
-        # ---- Controller model ------------------------------------------------
-        # Both articulations in one builder so ControllerJointImpedance can
-        # derive per-robot DOF counts and run FK/dynamics for both.
-        ctrl_builder = newton.ModelBuilder()
-        _add_revolute_chain(ctrl_builder, DOFS_A, LINK_LEN_A, x_offset=-0.5, label="robot_a")
-        _add_revolute_chain(ctrl_builder, DOFS_B, LINK_LEN_B, x_offset=+0.5, label="robot_b")
-        # ctrl_builder is passed to ControllerJointImpedance; it finalizes it internally.
-
         # ---- Physics scene ---------------------------------------------------
-        # Identical topology to ctrl_builder, with effort-control mode.
+        # One model, shared with the controller. Effort-control mode so the
+        # controller's torques drive the joints directly.
         scene = newton.ModelBuilder()
         _add_revolute_chain(scene, DOFS_A, LINK_LEN_A, x_offset=-0.5, label="robot_a")
         _add_revolute_chain(scene, DOFS_B, LINK_LEN_B, x_offset=+0.5, label="robot_b")
@@ -152,14 +145,13 @@ class Example:
         default_idx = wp.array(np.arange(TOTAL_DOFS, dtype=np.uint32), device=self.device)
 
         self.controller = ControllerJointImpedance(
-            builder=ctrl_builder,
+            self.model,
             default_dof_indices=default_idx,
             stiffness=wp.array(KP, dtype=wp.float32, device=self.device),
             damping=wp.array(KD, dtype=wp.float32, device=self.device),
             use_gravity_compensation=True,
             use_coriolis_compensation=False,
             use_inertia_decoupling=True,
-            device=self.device,
         )
 
         self._input = self.controller.input()
