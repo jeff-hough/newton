@@ -1273,6 +1273,14 @@ add_example_test(
     use_viewer=True,
 )
 
+add_example_test(
+    TestControllersExamples,
+    name="controllers.example_controller_diff_ik_heterogeneous",
+    devices=cuda_test_devices,
+    test_options={"num-frames": 120},
+    use_viewer=True,
+)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

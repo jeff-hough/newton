@@ -21,6 +21,18 @@ subclass of :class:`ControllerBase`.
    :toctree: _generated
    :nosignatures:
 
+   CommandType
    ControllerBase
+   ControllerDifferentialKinematics
+   ControllerDifferentialKinematicsModelFree
    ControllerJointImpedance
    ControllerJointImpedanceModelFree
+   IkMethod
+
+.. rubric:: Functions
+
+.. autosummary::
+   :toctree: _generated
+   :signatures: long
+
+   select_joints
