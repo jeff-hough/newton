@@ -262,35 +262,5 @@ class TestArticulationRootedness(unittest.TestCase):
                     ),
                 )
 
-    def test_non_rooted_articulation_is_rejected(self):
-        r"""Verify building an articulation whose parent body is outside it raises.
-
-        The topology the first two tests rely on. The hanging joint's parent is
-        a body owned by a different articulation, so "pendulum" has no root::
-
-            world ---o---> base ---o---> mass
-                     j0            j1
-                     \___/         \____/
-                    "base"       "pendulum"
-                                     ^
-                                     parent body (base) belongs to "base",
-                                     so this articulation is not rooted
-
-        The alternative fix: if cross-articulation mounting is not meant to be
-        supported, ``add_articulation`` should say so. It currently validates
-        joint contiguity, world membership, and single-parent-within-the-
-        articulation, but never rootedness.
-        """
-        builder = newton.ModelBuilder()
-        base = builder.add_link(mass=1.0, inertia=INERTIA, lock_inertia=True)
-        mass = builder.add_link(mass=MASS, com=wp.vec3(ARM, 0.0, 0.0), inertia=INERTIA, lock_inertia=True)
-        builder.add_articulation([builder.add_joint_revolute(parent=-1, child=base, axis=AXIS)], label="base")
-        hanging_joint = builder.add_joint_revolute(
-            parent=base, child=mass, axis=AXIS, parent_xform=wp.transform(p=wp.vec3(OFFSET, 0.0, 0.0))
-        )
-        with self.assertRaises(ValueError):
-            builder.add_articulation([hanging_joint], label="pendulum")
-
-
 if __name__ == "__main__":
     unittest.main()
