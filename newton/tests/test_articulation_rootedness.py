@@ -16,7 +16,9 @@ and violating it produces silently wrong dynamics two ways:
    another articulation's thread, or by a later joint in its own articulation.
 
 Every test builds the same two-body mechanism: a base body on a revolute joint,
-carrying a 2 kg mass on a second revolute joint 1 m further out.
+carrying a 2 kg mass on a second revolute joint 1 m further out. One test adds a
+bystander body on its own joint, to have something for a stray write to land in.
+Each test spells out its own dimensions, so it can be read on its own.
 """
 
 import unittest
@@ -26,15 +28,6 @@ import warp as wp
 
 import newton
 from newton.tests.unittest_utils import get_test_devices
-
-MASS = 2.0  # mass of the carried body [kg]
-ARM = 1.0  # its COM offset from its own joint [m]
-OFFSET = 1.0  # its joint's offset from the base body origin [m]
-BASE_ARM = 1.0  # base body origin's offset from its own joint axis [m]
-IZZ = 0.1  # spin inertia of each body about its own COM [kg m^2]
-INERTIA = wp.mat33(np.diag([IZZ, IZZ, IZZ]).astype(np.float32))
-BASE_ANGLE = 0.7  # [rad]
-AXIS = wp.vec3(0.0, 0.0, 1.0)
 
 
 def _fk(model, base_angle=0.0, base_joint=0):
@@ -49,46 +42,174 @@ def _fk(model, base_angle=0.0, base_joint=0):
 
 
 class TestArticulationRootedness(unittest.TestCase):
+    def test_jacobian_predicts_the_velocity_fk_computes_for_a_mounted_pendulum(self):
+        r"""Verify ``J @ joint_qd`` reproduces the body velocity ``eval_fk`` computes.
+
+        :func:`newton.eval_jacobian` documents that ``J_link @ joint_qd ==
+        state.body_qd[link]``, so the two ways of asking "how fast is this body
+        moving?" must agree. Only the pendulum joint spins, at 1 rad/s::
+
+            j0         j1        mass
+            o----------o--------->*   the COM is 1 m from j1,
+            |<- 1 m -->|<- 1 m -->|   so it moves at 1 m/s
+            \_"base"_/\_"pendulum"_/
+
+        ``eval_fk`` gets 1 m/s. The Jacobian says 2 m/s — the speed the COM would
+        have if it were spinning about j0, 2 m away — because the pendulum's
+        ancestor is the base joint, which lies outside the pendulum articulation.
+        Its column index comes out negative and lands on the pendulum's own
+        column, overwriting it.
+        """
+        inertia = wp.mat33(np.diag([0.1, 0.1, 0.1]).astype(np.float32))  # about each body's own COM [kg m^2]
+        axis = wp.vec3(0.0, 0.0, 1.0)
+
+        for device in get_test_devices():
+            with self.subTest(device=str(device)):
+                builder = newton.ModelBuilder()
+                base = builder.add_link(mass=1.0, inertia=inertia, lock_inertia=True)
+                builder.add_articulation([builder.add_joint_revolute(parent=-1, child=base, axis=axis)], label="base")
+                mass = builder.add_link(
+                    mass=2.0,
+                    com=wp.vec3(1.0, 0.0, 0.0),  # 1 m out from its own joint
+                    inertia=inertia,
+                    lock_inertia=True,
+                )
+                builder.add_articulation(
+                    [
+                        builder.add_joint_revolute(
+                            parent=base,
+                            child=mass,
+                            axis=axis,
+                            parent_xform=wp.transform(p=wp.vec3(1.0, 0.0, 0.0)),  # 1 m out from the base body
+                        )
+                    ],
+                    label="pendulum",
+                )
+                model = builder.finalize(device=device)
+
+                state = model.state()
+                state.joint_qd.assign(np.array([0.0, 1.0], dtype=np.float32))  # spin only the pendulum joint
+                newton.eval_fk(model, state.joint_q, state.joint_qd, state)
+
+                pendulum_jacobian = newton.eval_jacobian(model, state).numpy()[1]
+                predicted = pendulum_jacobian @ np.array([1.0])
+                np.testing.assert_allclose(
+                    predicted,
+                    state.body_qd.numpy()[1],
+                    atol=1e-5,
+                    err_msg=(
+                        "the Jacobian and forward kinematics disagree about the body's velocity\n"
+                        f"  J @ joint_qd:   {np.array2string(predicted, precision=4)}\n"
+                        f"  state.body_qd:  {np.array2string(state.body_qd.numpy()[1], precision=4)}"
+                    ),
+                )
+
+    def test_jacobian_block_is_unchanged_by_an_unrelated_articulation(self):
+        r"""Verify an articulation's Jacobian block does not depend on the others.
+
+        Where the previous test shows the wrong number, this one shows the write
+        leaving the memory it owns. ``eval_jacobian`` gives each articulation its
+        own ``J[i]`` block, so the "spinner" block below is a function of that
+        articulation alone. Adding a pendulum that shares no body, joint or DOF
+        with it cannot change it::
+
+            spinner       base            pendulum
+            o             o----------o----------*
+                          \_"base"_/\_"pendulum"_/
+
+        The pendulum's ancestor is the base joint, outside its articulation, so
+        its column comes out at ``joint_qd_start[ancestor] -
+        articulation_dof_start = -2`` — two below its own single-column block.
+        Warp resolves a negative index by adding the dimension size once, which
+        here leaves it at ``-1``, so the write lands in the spinner's block and
+        overwrites its last entry.
+
+        No expected value is asserted, only that the block is untouched, so this
+        holds whatever the Jacobian ought to contain.
+        """
+        inertia = wp.mat33(np.diag([0.1, 0.1, 0.1]).astype(np.float32))  # about each body's own COM [kg m^2]
+        axis = wp.vec3(0.0, 0.0, 1.0)
+
+        def spinner_jacobian_block(device, *, mount_pendulum):
+            builder = newton.ModelBuilder()
+
+            base = builder.add_link(mass=1.0, inertia=inertia, lock_inertia=True)
+            builder.add_articulation([builder.add_joint_revolute(parent=-1, child=base, axis=axis)], label="base")
+
+            spinner = builder.add_link(mass=1.0, inertia=inertia, lock_inertia=True)
+            builder.add_articulation([builder.add_joint_revolute(parent=-1, child=spinner, axis=axis)], label="spinner")
+
+            if mount_pendulum:
+                mass = builder.add_link(
+                    mass=2.0,
+                    com=wp.vec3(1.0, 0.0, 0.0),  # 1 m out from its own joint
+                    inertia=inertia,
+                    lock_inertia=True,
+                )
+                builder.add_articulation(
+                    [
+                        builder.add_joint_revolute(
+                            parent=base,
+                            child=mass,
+                            axis=axis,
+                            parent_xform=wp.transform(p=wp.vec3(1.0, 0.0, 0.0)),  # 1 m out from the base body
+                        )
+                    ],
+                    label="pendulum",
+                )
+
+            model = builder.finalize(device=device)
+            return newton.eval_jacobian(model, _fk(model)).numpy()[1]
+
+        for device in get_test_devices():
+            with self.subTest(device=str(device)):
+                alone = spinner_jacobian_block(device, mount_pendulum=False)
+                mounted = spinner_jacobian_block(device, mount_pendulum=True)
+                np.testing.assert_array_equal(
+                    mounted,
+                    alone,
+                    err_msg=(
+                        "adding an unrelated articulation changed the spinner's Jacobian block\n"
+                        f"  without the pendulum: {alone.ravel()}\n"
+                        f"  with the pendulum:    {mounted.ravel()}"
+                    ),
+                )
+
     def test_mass_matrix_matches_when_pendulum_is_mounted_on_another_articulation(self):
         r"""Verify a pendulum's mass matrix is the same mounted as it is standalone.
 
         Both models drawn at q=0, with (o) a revolute joint about z and (*) the
         2 kg mass. The pendulum is identical in both: same mass, same Izz, same
-        ARM = 1 m radius about its own joint::
+        1 m radius about its own joint::
 
             standalone      mounted
             ----------      -------
             j0    mass      j0         j1        mass
             o----------*    o----------o----------*
             |<- 1 m -->|    |<- 1 m -->|<- 1 m -->|
-                ARM            OFFSET       ARM
                             \_"base"_/\_"pendulum"_/
 
-        A 2 kg mass on a 1 m arm has moment of inertia ``Izz + m*ARM^2 = 2.1``
-        about its own joint axis. That is a property of the pendulum alone, so
-        mounting it on another body cannot change it.
-
-        Newton returns 8.1 = ``Izz + m*(OFFSET + ARM)^2`` — the radius measured
-        from j0 rather than j1, because the ancestor's Jacobian column overwrote
-        the pendulum's own at a negative column index.
-
-        The base body sits on its own joint axis here, which keeps the result
-        deterministic. Offsetting it would let the FK race of the other tests
-        feed this number too, making it differ per device.
         """
-        expected = IZZ + MASS * ARM**2
+
+        inertia = wp.mat33(np.diag([0.1, 0.1, 0.1]).astype(np.float32))  # about each body's own COM [kg m^2]
+        axis = wp.vec3(0.0, 0.0, 1.0)
+        expected = 0.1 + 2.0 * 1.0**2  # Izz + m*r^2 about the pendulum's own joint
+
         for device in get_test_devices():
             with self.subTest(device=str(device)):
                 alone = newton.ModelBuilder()
-                mass = alone.add_link(mass=MASS, com=wp.vec3(ARM, 0.0, 0.0), inertia=INERTIA, lock_inertia=True)
-                alone.add_articulation([alone.add_joint_revolute(parent=-1, child=mass, axis=AXIS)], label="pendulum")
+                mass = alone.add_link(mass=2.0, com=wp.vec3(1.0, 0.0, 0.0), inertia=inertia, lock_inertia=True)
+                alone.add_articulation([alone.add_joint_revolute(parent=-1, child=mass, axis=axis)], label="pendulum")
 
                 mounted = newton.ModelBuilder()
-                base = mounted.add_link(mass=1.0, inertia=INERTIA, lock_inertia=True)
-                mass = mounted.add_link(mass=MASS, com=wp.vec3(ARM, 0.0, 0.0), inertia=INERTIA, lock_inertia=True)
-                mounted.add_articulation([mounted.add_joint_revolute(parent=-1, child=base, axis=AXIS)], label="base")
+                base = mounted.add_link(mass=1.0, inertia=inertia, lock_inertia=True)
+                mass = mounted.add_link(mass=2.0, com=wp.vec3(1.0, 0.0, 0.0), inertia=inertia, lock_inertia=True)
+                mounted.add_articulation([mounted.add_joint_revolute(parent=-1, child=base, axis=axis)], label="base")
                 hanging_joint = mounted.add_joint_revolute(
-                    parent=base, child=mass, axis=AXIS, parent_xform=wp.transform(p=wp.vec3(OFFSET, 0.0, 0.0))
+                    parent=base,
+                    child=mass,
+                    axis=axis,
+                    parent_xform=wp.transform(p=wp.vec3(1.0, 0.0, 0.0)),  # 1 m out from the base body
                 )
                 mounted.add_articulation([hanging_joint], label="pendulum")
 
@@ -132,20 +253,28 @@ class TestArticulationRootedness(unittest.TestCase):
         On CUDA the pendulum articulation reads ``body_q[base]`` before the base
         articulation has written it. What it reads is the *unwritten* value — the
         identity transform ``state.body_q`` was allocated with — so the link
-        lands OFFSET from the world origin at ``[1, 0, 0]``. Note that is not
-        the base's q=0 pose either, which would put it at ``[2, 0, 0]``. CPU
-        happens to schedule the base first, so this test passes there.
+        lands 1 m from the world origin at ``[1, 0, 0]``. Note that is not the
+        base's q=0 pose either, which would put it at ``[2, 0, 0]``. CPU happens
+        to schedule the base first, so this test passes there.
         """
+        inertia = wp.mat33(np.diag([0.1, 0.1, 0.1]).astype(np.float32))  # about each body's own COM [kg m^2]
+        axis = wp.vec3(0.0, 0.0, 1.0)
 
         def build(device, *, split):
             builder = newton.ModelBuilder()
-            base = builder.add_link(mass=1.0, inertia=INERTIA, lock_inertia=True)
-            mass = builder.add_link(mass=MASS, com=wp.vec3(ARM, 0.0, 0.0), inertia=INERTIA, lock_inertia=True)
+            base = builder.add_link(mass=1.0, inertia=inertia, lock_inertia=True)
+            mass = builder.add_link(mass=2.0, com=wp.vec3(1.0, 0.0, 0.0), inertia=inertia, lock_inertia=True)
             base_joint = builder.add_joint_revolute(
-                parent=-1, child=base, axis=AXIS, child_xform=wp.transform(p=wp.vec3(-BASE_ARM, 0.0, 0.0))
+                parent=-1,
+                child=base,
+                axis=axis,
+                child_xform=wp.transform(p=wp.vec3(-1.0, 0.0, 0.0)),  # base origin sits 1 m out from its axis
             )
             hanging_joint = builder.add_joint_revolute(
-                parent=base, child=mass, axis=AXIS, parent_xform=wp.transform(p=wp.vec3(OFFSET, 0.0, 0.0))
+                parent=base,
+                child=mass,
+                axis=axis,
+                parent_xform=wp.transform(p=wp.vec3(1.0, 0.0, 0.0)),  # 1 m out from the base body
             )
             if split:
                 builder.add_articulation([base_joint], label="base")
@@ -156,8 +285,8 @@ class TestArticulationRootedness(unittest.TestCase):
 
         for device in get_test_devices():
             with self.subTest(device=str(device)):
-                whole = _fk(build(device, split=False), BASE_ANGLE).body_q.numpy()[:, :3]
-                apart = _fk(build(device, split=True), BASE_ANGLE).body_q.numpy()[:, :3]
+                whole = _fk(build(device, split=False), 0.7).body_q.numpy()[:, :3]
+                apart = _fk(build(device, split=True), 0.7).body_q.numpy()[:, :3]
                 np.testing.assert_allclose(
                     apart,
                     whole,
@@ -212,28 +341,35 @@ class TestArticulationRootedness(unittest.TestCase):
         each joint's parent body to have been placed already. Declaring the
         hanging joint first breaks that: the link is positioned from the
         *unwritten* base transform — the identity ``state.body_q`` was allocated
-        with — landing it OFFSET from the world origin at ``[1, 0, 0]``. Note
-        that is not the base's q=0 pose either, which would put it at
-        ``[2, 0, 0]``.
+        with — landing it 1 m from the world origin at ``[1, 0, 0]``. Note that
+        is not the base's q=0 pose either, which would put it at ``[2, 0, 0]``.
 
         No second articulation is involved here. One articulation whose joints
         are not in topological order is enough, and ``add_articulation``
         accepts it.
         """
+        inertia = wp.mat33(np.diag([0.1, 0.1, 0.1]).astype(np.float32))  # about each body's own COM [kg m^2]
+        axis = wp.vec3(0.0, 0.0, 1.0)
 
         def build(device, *, base_joint_first):
             builder = newton.ModelBuilder()
-            base = builder.add_link(mass=1.0, inertia=INERTIA, lock_inertia=True)
-            mass = builder.add_link(mass=MASS, com=wp.vec3(ARM, 0.0, 0.0), inertia=INERTIA, lock_inertia=True)
+            base = builder.add_link(mass=1.0, inertia=inertia, lock_inertia=True)
+            mass = builder.add_link(mass=2.0, com=wp.vec3(1.0, 0.0, 0.0), inertia=inertia, lock_inertia=True)
 
             def add_base_joint():
                 return builder.add_joint_revolute(
-                    parent=-1, child=base, axis=AXIS, child_xform=wp.transform(p=wp.vec3(-BASE_ARM, 0.0, 0.0))
+                    parent=-1,
+                    child=base,
+                    axis=axis,
+                    child_xform=wp.transform(p=wp.vec3(-1.0, 0.0, 0.0)),  # base origin sits 1 m out from its axis
                 )
 
             def add_hanging_joint():
                 return builder.add_joint_revolute(
-                    parent=base, child=mass, axis=AXIS, parent_xform=wp.transform(p=wp.vec3(OFFSET, 0.0, 0.0))
+                    parent=base,
+                    child=mass,
+                    axis=axis,
+                    parent_xform=wp.transform(p=wp.vec3(1.0, 0.0, 0.0)),  # 1 m out from the base body
                 )
 
             if base_joint_first:
@@ -247,8 +383,8 @@ class TestArticulationRootedness(unittest.TestCase):
             with self.subTest(device=str(device)):
                 ordered, ordered_base = build(device, base_joint_first=True)
                 shuffled, shuffled_base = build(device, base_joint_first=False)
-                expected = _fk(ordered, BASE_ANGLE, ordered_base).body_q.numpy()[:, :3]
-                actual = _fk(shuffled, BASE_ANGLE, shuffled_base).body_q.numpy()[:, :3]
+                expected = _fk(ordered, 0.7, ordered_base).body_q.numpy()[:, :3]
+                actual = _fk(shuffled, 0.7, shuffled_base).body_q.numpy()[:, :3]
                 np.testing.assert_allclose(
                     actual,
                     expected,
@@ -261,6 +397,7 @@ class TestArticulationRootedness(unittest.TestCase):
                         f"  hanging-first={np.array2string(actual[1], precision=4)}"
                     ),
                 )
+
 
 if __name__ == "__main__":
     unittest.main()
