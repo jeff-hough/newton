@@ -42,6 +42,7 @@ class _EffortModeExplicit:
         dt: float | None,
         custom_inputs: dict[str, Any] | None = None,
         bias_force: wp.array[float] | None = None,
+        battery_kwargs: dict[str, Any] | None = None,
     ) -> wp.array[float]:
         """Compute raw effort into *computed_forces*, clamp into *applied_forces*.
 
@@ -65,6 +66,7 @@ class _EffortModeExplicit:
             drive_state,
             dt,
             **compute_kwargs,
+            **(battery_kwargs or {}),
         )
         forces = computed_forces
         for clamp in self._clamping:

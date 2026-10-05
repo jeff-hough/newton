@@ -945,6 +945,7 @@ class _EffortModeImplicit:
         dt: float | None,
         custom_inputs: dict[str, Any] | None = None,
         bias_force: wp.array[float] | None = None,
+        battery_kwargs: dict[str, Any] | None = None,
     ) -> wp.array[float]:
         """Solve implicit effort and return the applied-effort buffer.
 
@@ -962,6 +963,8 @@ class _EffortModeImplicit:
         predicted end-of-step velocity is ``qd + A (p - h bias_force)`` instead
         of ``qd + A p``.
         """
+        if battery_kwargs is not None:
+            raise NotImplementedError("Implicit actuation does not support a battery")
         if dt is None:
             raise ValueError("Implicit actuation requires dt")
         if dt <= 0.0:
