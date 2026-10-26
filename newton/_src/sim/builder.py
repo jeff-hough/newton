@@ -804,6 +804,15 @@ class ModelBuilder:
             Model.AttributeFrequency.ONCE,
             compaction_policy="passthrough",
         ),
+        "_actuator_battery": Model.AttributeSpec(
+            Model.AttributeFrequency.ACTUATOR, references=Model.AttributeFrequency.BATTERY
+        ),
+        "_battery_nominal_voltage": Model.AttributeSpec(Model.AttributeFrequency.BATTERY),
+        "_battery_resistance": Model.AttributeSpec(Model.AttributeFrequency.BATTERY),
+        "_battery_min_voltage": Model.AttributeSpec(Model.AttributeFrequency.BATTERY),
+        "_battery_world": Model.AttributeSpec(
+            Model.AttributeFrequency.BATTERY, references=Model.AttributeFrequency.WORLD
+        ),
     }
 
     _BUILDER_GROUP_REFERENCES: ClassVar[dict[str, dict[str, Model.AttributeFrequency]]] = {
@@ -2415,8 +2424,16 @@ class ModelBuilder:
         """Total joint constraint count propagated to :attr:`Model.joint_constraint_count`."""
         self.actuator_count: int = 0
         """Total actuator count propagated to :attr:`Model.actuator_count`."""
-        self.battery_count: int = 0
-        """Total battery count propagated to :attr:`Model.battery_count`."""
+        self._actuator_battery: list[int] = []
+        """Battery of each actuator, ``-1`` for none."""
+        self._battery_nominal_voltage: list[float] = []
+        """Voltage without load of each battery [V]."""
+        self._battery_resistance: list[float] = []
+        """Internal resistance of each battery [Ω]."""
+        self._battery_min_voltage: list[float] = []
+        """Lowest voltage under load of each battery [V]."""
+        self._battery_world: list[int] = []
+        """World of each battery, ``-1`` for none."""
 
         self._current_world: int = -1
         """Internal world context backing the read-only :attr:`current_world` property."""
@@ -2560,6 +2577,11 @@ class ModelBuilder:
     def _equality_constraint_count(self) -> int:
         """Number of equality constraints added to this builder (from the ``mujoco:equality_constraint`` counter)."""
         return self._custom_frequency_counts.get("mujoco:equality_constraint", 0)
+
+    @property
+    def battery_count(self) -> int:
+        """Number of batteries added with :meth:`add_battery`."""
+        return len(self._battery_nominal_voltage)
 
     @property
     def tendon_count(self) -> int:
@@ -3469,6 +3491,7 @@ class ModelBuilder:
             register_actuator_attributes(self)
         actuator = self.actuator_count
         self.actuator_count += 1
+        self._actuator_battery.append(-1)
         self._process_custom_attributes(
             actuator, {f"{ACTUATOR_NAMESPACE}:actuator_dof": index}, Model.AttributeFrequency.ACTUATOR
         )
@@ -3485,16 +3508,15 @@ class ModelBuilder:
     ) -> int:
         """Add a battery shared by the given actuators of the current world.
 
-        Each step, :func:`~newton.actuators.update_battery_supply` drops its
-        voltage with the total current of *actuators* and writes it into
-        ``control.actuator_supply_voltage``, and
-        :func:`~newton.actuators.reset_battery_supply` restores the nominal
-        voltage. ``control.actuator_supply_voltage`` starts at the nominal
-        voltage. The battery parameters are stored on the :class:`~newton.Model`
-        under the ``actuation`` namespace as ``battery_nominal_voltage``,
-        ``battery_resistance``, ``battery_min_voltage`` and ``battery_world``,
-        and the battery of each actuator as ``actuator_battery`` (``-1`` for
-        none). :meth:`replicate` copies the batteries into every world.
+        :meth:`finalize` creates one
+        :class:`~newton.actuators.BatteryInternalResistance` holding all
+        batteries in :attr:`Model.batteries <newton.Model.batteries>`. Each
+        step, its :meth:`~newton.actuators.BatteryInternalResistance.step`
+        drops the voltage with the total current of *actuators* and writes it
+        into ``control.actuator_supply_voltage``, and its
+        :meth:`~newton.actuators.BatteryInternalResistance.reset` restores the
+        nominal voltage. ``control.actuator_supply_voltage`` starts at the
+        nominal voltage. :meth:`replicate` copies the batteries into every world.
         :meth:`add_usd` calls this method for each ``NewtonBattery`` prim.
 
         Args:
@@ -3519,7 +3541,7 @@ class ModelBuilder:
                 a battery, or already has a battery.
         """
         from ..actuators.actuator import ACTUATOR_NAMESPACE  # noqa: PLC0415
-        from ..actuators.battery import register_battery_attributes  # noqa: PLC0415
+        from ..actuators.batteries.base import register_battery_attributes  # noqa: PLC0415
 
         if not 0.0 <= min_voltage <= nominal_voltage:
             raise ValueError(
@@ -3533,7 +3555,7 @@ class ModelBuilder:
         actuator_dof = (
             self.custom_attributes[f"{ACTUATOR_NAMESPACE}:actuator_dof"].values if self.actuator_count else {}
         )
-        if not self.has_custom_attribute(f"{ACTUATOR_NAMESPACE}:battery_nominal_voltage"):
+        if not self.has_custom_attribute("actuator_supply_voltage"):
             register_battery_attributes(self)
         for actuator in actuators:
             if not 0 <= actuator < self.actuator_count:
@@ -3557,25 +3579,19 @@ class ModelBuilder:
                 raise ValueError(
                     f"add_battery: actuator {actuator} does not draw from a battery; add it with supply_from_battery=True"
                 )
-            battery = self.custom_attributes[f"{ACTUATOR_NAMESPACE}:actuator_battery"].values.get(actuator)
-            if battery is not None and battery >= 0:
-                raise ValueError(f"add_battery: actuator {actuator} already draws from battery {battery}")
+            if self._actuator_battery[actuator] >= 0:
+                raise ValueError(
+                    f"add_battery: actuator {actuator} already draws from battery {self._actuator_battery[actuator]}"
+                )
         battery = self.battery_count
-        self.battery_count += 1
+        self._battery_nominal_voltage.append(nominal_voltage)
+        self._battery_resistance.append(resistance)
+        self._battery_min_voltage.append(min_voltage)
+        self._battery_world.append(self.current_world)
+        for actuator in actuators:
+            self._actuator_battery[actuator] = battery
         self._process_custom_attributes(
-            battery,
-            {
-                f"{ACTUATOR_NAMESPACE}:battery_nominal_voltage": nominal_voltage,
-                f"{ACTUATOR_NAMESPACE}:battery_resistance": resistance,
-                f"{ACTUATOR_NAMESPACE}:battery_min_voltage": min_voltage,
-                f"{ACTUATOR_NAMESPACE}:battery_world": self.current_world,
-            },
-            Model.AttributeFrequency.BATTERY,
-        )
-        self._process_custom_attributes(
-            actuators,
-            {f"{ACTUATOR_NAMESPACE}:actuator_battery": battery, "actuator_supply_voltage": nominal_voltage},
-            Model.AttributeFrequency.ACTUATOR,
+            actuators, {"actuator_supply_voltage": nominal_voltage}, Model.AttributeFrequency.ACTUATOR
         )
         return battery
 
@@ -4422,7 +4438,6 @@ class ModelBuilder:
                 entity_offsets["actuator"],
             )
         self.actuator_count += copy_count * counts["actuator"]
-        self.battery_count += copy_count * counts["battery"]
 
     @staticmethod
     @functools.cache
@@ -16223,7 +16238,7 @@ class ModelBuilder:
             )
 
             # Create actuators from accumulated entries
-            from ..actuators.actuator import ACTUATOR_NAMESPACE, Actuator  # noqa: PLC0415
+            from ..actuators.actuator import Actuator  # noqa: PLC0415
 
             m.actuators = []
             for entry in self.actuator_entries.values():
@@ -16279,12 +16294,10 @@ class ModelBuilder:
                 )
 
                 if "actuator_supply_voltage" in drive.custom_inputs:
-                    actuator_battery = self.custom_attributes.get(f"{ACTUATOR_NAMESPACE}:actuator_battery")
-                    assigned = (actuator_battery.values if actuator_battery is not None else None) or {}
                     missing = [
                         row
                         for row, args in zip(entry.actuator_indices, entry.drive_args, strict=True)
-                        if args.get("supply_from_battery") and assigned.get(row, -1) < 0
+                        if args.get("supply_from_battery") and self._actuator_battery[row] < 0
                     ]
                     if missing:
                         warnings.warn(
@@ -16296,6 +16309,27 @@ class ModelBuilder:
 
                 actuator.register_custom_attributes(self)
                 m.actuators.append(actuator)
+
+            m.batteries = []
+            if self.battery_count:
+                from ..actuators.batteries import BatteryInternalResistance  # noqa: PLC0415
+
+                actuator_battery = np.asarray(self._actuator_battery, dtype=np.int64)
+                assigned = np.flatnonzero(actuator_battery >= 0)
+                actuators = assigned[np.argsort(actuator_battery[assigned], kind="stable")]
+                counts = np.bincount(actuator_battery[assigned], minlength=self.battery_count)
+                m.batteries.append(
+                    BatteryInternalResistance(
+                        nominal_voltage=wp.array(self._battery_nominal_voltage, dtype=wp.float32, device=device),
+                        resistance=wp.array(self._battery_resistance, dtype=wp.float32, device=device),
+                        min_voltage=wp.array(self._battery_min_voltage, dtype=wp.float32, device=device),
+                        actuator_start=wp.array(
+                            np.concatenate(([0], np.cumsum(counts))), dtype=wp.int32, device=device
+                        ),
+                        actuators=wp.array(actuators, dtype=wp.int32, device=device),
+                        world=wp.array(self._battery_world, dtype=wp.int32, device=device),
+                    )
+                )
 
             # Add custom attributes onto the model (with lazy evaluation)
             self._resolve_custom_frequency_articulation_owners()
