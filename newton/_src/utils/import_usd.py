@@ -2817,7 +2817,6 @@ def parse_usd(
         builder.set_joint_mimic(joint=joint_idx, reference_joint=leader_idx, coeffs=(coef0, coef1))
 
     # Parse Newton actuator prims from the USD stage.
-    from ..actuators.batteries import BatteryInternalResistance  # noqa: PLC0415
     from ..actuators.input_processors.base import InputProcessorBase  # noqa: PLC0415
     from ..actuators.usd_parser import parse_actuator_prim, parse_battery_prim  # noqa: PLC0415
 
@@ -2903,10 +2902,10 @@ def parse_usd(
     if verbose and actuator_count > 0:
         logger.info("Added %s actuator(s) from USD", actuator_count)
     for battery_path in battery_actuators.keys() - batteries.keys():
-        raise ValueError(f"Actuators reference '{battery_path}' in 'newton:battery', which is not a NewtonBattery prim")
-    for path, kwargs in batteries.items():
+        raise ValueError(f"Actuators reference '{battery_path}' in 'newton:battery', which is not a battery prim")
+    for path, battery in batteries.items():
         if path in battery_actuators:
-            builder.add_battery(BatteryInternalResistance, battery_actuators[path], **kwargs)
+            builder.add_battery(battery.battery_class, battery_actuators[path], **battery.battery_kwargs)
 
     result = {
         "fps": stage.GetFramesPerSecond(),
