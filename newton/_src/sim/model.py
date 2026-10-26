@@ -252,8 +252,6 @@ class Model:
         """Experimental frequency for recorded deformable volumes (see :attr:`~newton.Model.volume_count`)."""
         ACTUATOR = 26
         """Attribute frequency follows the number of actuators (see :attr:`~newton.Model.actuator_count`)."""
-        BATTERY = 27
-        """Attribute frequency follows the number of batteries (see :attr:`~newton.Model.battery_count`)."""
 
     @dataclass(frozen=True)
     class AttributeSpec:
@@ -681,7 +679,6 @@ class Model:
         AttributeFrequency.WORLD: "world_count",
         AttributeFrequency.ATTACHMENT_PARTICLE_BODY: "attachment_particle_body_count",
         AttributeFrequency.ACTUATOR: "actuator_count",
-        AttributeFrequency.BATTERY: "battery_count",
         AttributeFrequency.CONTACT: "contact_max",
         AttributeFrequency.CONTACT_RIGID: "rigid_contact_max",
         AttributeFrequency.CONTACT_SOFT: "soft_contact_max",
