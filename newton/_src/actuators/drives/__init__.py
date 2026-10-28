@@ -10,7 +10,6 @@ from .drive_pd import DrivePD
 from .drive_pid import DrivePID
 
 __all__ = [
-    "DriveBAM",
     "DriveBase",
     "DriveNeuralGRU",
     "DriveNeuralLSTM",
