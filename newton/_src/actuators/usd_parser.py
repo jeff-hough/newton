@@ -14,7 +14,7 @@ from newton._src.usd.utils import _resolve_asset_path, get_applied_api_schemas
 
 from ..exceptions import NewtonDeprecationWarning, NewtonWarning
 from .batteries import BatteryBase, BatteryConstantResistance
-from .clamping import ClampingBase, ClampingCurrentPWM, ClampingDCMotor, ClampingMaxEffort, ClampingPositionBased
+from .clamping import ClampingBase, ClampingCurrentDuty, ClampingDCMotor, ClampingMaxEffort, ClampingPositionBased
 from .drives import (
     DriveBase,
     DriveNeuralGRU,
@@ -22,7 +22,6 @@ from .drives import (
     DriveNeuralMLP,
     DrivePD,
     DrivePID,
-    DriveVoltageControlled,
 )
 from .input_processors import InputProcessorBase, InputProcessorEncoder
 from .input_processors.input_processor_delay import InputProcessorDelay
@@ -205,6 +204,9 @@ def _read_schema_attrs(prim, schema_name: str) -> dict[str, Any]:
 
     defn = Usd.SchemaRegistry().FindAppliedAPIPrimDefinition(schema_name)
     schema_props = set(defn.GetPropertyNames()) if defn is not None else None
+    if schema_props is not None and schema_name == "NewtonCurrentDutyClampingAPI":
+        # Accept the explicit estimate settings with older schema packages.
+        schema_props.update(("newton:voltageSource", "newton:nominalVoltage", "newton:vMin"))
 
     kwargs: dict[str, Any] = {}
     for prop in prim.GetAuthoredPropertiesInNamespace("newton"):
@@ -297,7 +299,7 @@ class SchemaNames:
     MAX_EFFORT_CLAMPING = "NewtonMaxEffortClampingAPI"
     DC_MOTOR_CLAMPING = "NewtonDCMotorClampingAPI"
     POSITION_BASED_CLAMPING = "NewtonPositionBasedClampingAPI"
-    CURRENT_PWM_CLAMPING = "NewtonCurrentPWMClampingAPI"
+    CURRENT_DUTY_CLAMPING = "NewtonCurrentDutyClampingAPI"
 
     DC_MOTOR = "NewtonDCMotorAPI"
 
@@ -309,11 +311,11 @@ _SCHEMA_REGISTRY: dict[str, _SchemaEntry] = {
     SchemaNames.PD_CONTROL: _SchemaEntry(DrivePD, ComponentKind.DRIVE),
     SchemaNames.PID_CONTROL: _SchemaEntry(DrivePID, ComponentKind.DRIVE),
     SchemaNames.NEURAL_CONTROL: _SchemaEntry(_resolve_neural_drive, ComponentKind.DRIVE),
-    SchemaNames.VOLTAGE_CONTROL: _SchemaEntry(DriveVoltageControlled, ComponentKind.DRIVE),
+    SchemaNames.VOLTAGE_CONTROL: _SchemaEntry(DrivePD, ComponentKind.DRIVE),
     SchemaNames.MAX_EFFORT_CLAMPING: _SchemaEntry(ClampingMaxEffort, ComponentKind.CLAMPING),
     SchemaNames.DC_MOTOR_CLAMPING: _SchemaEntry(ClampingDCMotor, ComponentKind.CLAMPING),
     SchemaNames.POSITION_BASED_CLAMPING: _SchemaEntry(ClampingPositionBased, ComponentKind.CLAMPING),
-    SchemaNames.CURRENT_PWM_CLAMPING: _SchemaEntry(ClampingCurrentPWM, ComponentKind.CLAMPING),
+    SchemaNames.CURRENT_DUTY_CLAMPING: _SchemaEntry(ClampingCurrentDuty, ComponentKind.CLAMPING),
     SchemaNames.DC_MOTOR: _SchemaEntry(MotorDC, ComponentKind.MOTOR),
     SchemaNames.DELAY: _SchemaEntry(InputProcessorDelay, ComponentKind.INPUT_PROCESSOR),
     SchemaNames.ENCODER: _SchemaEntry(InputProcessorEncoder, ComponentKind.INPUT_PROCESSOR),
@@ -478,6 +480,14 @@ def parse_actuator_prim(prim, *, allow_unsafe_torch_checkpoints: bool = False) -
         detected.append(schema_name)
 
         kwargs = _read_schema_attrs(prim, schema_name)
+        if schema_name == SchemaNames.VOLTAGE_CONTROL:
+            # Older assets split the duty gain into firmware kp and error_gain.
+            # Their product is the ordinary PD proportional gain, with kd=0.
+            gain = kwargs.pop("error_gain", 1.0)
+            kp = kwargs.get("kp", 0.0)
+            if gain < 0.0 or kp < 0.0:
+                raise ValueError(f"Actuator prim '{prim.GetPath()}' requires non-negative kp and error_gain")
+            kwargs.update(kp=kp * gain, kd=0.0, const_effort=0.0)
         if (
             schema_name == SchemaNames.NEURAL_CONTROL
             and not allow_unsafe_torch_checkpoints
@@ -521,6 +531,9 @@ def parse_actuator_prim(prim, *, allow_unsafe_torch_checkpoints: bool = False) -
 
     if drive_class is None:
         raise ValueError(f"Actuator prim '{prim.GetPath()}' has no drive schema (detected schemas: {detected})")
+
+    if SchemaNames.VOLTAGE_CONTROL in detected and not any(issubclass(cls, MotorDC) for cls, _ in component_specs):
+        raise ValueError(f"Actuator prim '{prim.GetPath()}' uses duty control, which requires a motor")
 
     batteries = _get_relationship_targets(prim, "newton:battery")
     if not drive_schema_registered:

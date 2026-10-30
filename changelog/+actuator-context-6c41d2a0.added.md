@@ -1,0 +1,1 @@
+Add shared physical context for actuator drives and clamps, with explicit `ClampingCurrentDuty.VoltageSource.INPUT` or `.NOMINAL` selection for current estimation (`newton:voltageSource` and `newton:nominalVoltage` in USD).

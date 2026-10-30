@@ -8,6 +8,7 @@ from typing import Any
 
 import warp as wp
 
+from ..context import ActuatorContext
 from .base import ClampingBase
 
 
@@ -77,6 +78,7 @@ class ClampingMaxEffort(ClampingBase):
         device: wp.Device | None = None,
         *,
         supply_voltage: wp.array[float] | None = None,
+        context: ActuatorContext | None = None,
     ) -> None:
         wp.launch(
             kernel=_box_clamp_kernel,

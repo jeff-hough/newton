@@ -7,20 +7,7 @@ from typing import Any, ClassVar
 
 import warp as wp
 
-
-@wp.kernel
-def _motor_dc_supply_voltage_kernel(
-    vin: wp.array[float],
-    supply_from_battery: wp.array[float],
-    battery_voltage: wp.array[float],
-    actuator_indices: wp.array[wp.uint32],
-    supply_voltage: wp.array[float],
-):
-    i = wp.tid()
-    voltage = vin[i]
-    if supply_from_battery[i] != 0.0:
-        voltage = battery_voltage[actuator_indices[i]]
-    supply_voltage[i] = voltage
+from .power_stage import _supply_voltage_kernel
 
 
 @wp.kernel
@@ -47,7 +34,7 @@ def _motor_dc_kernel(
 
 
 class MotorDC:
-    """DC motor driven by a PWM voltage, as in BAM (Better Actuator Models).
+    """DC motor driven by an average terminal voltage, as in BAM (Better Actuator Models).
 
     Computes the effort from the commanded voltage :math:`u`:
 
@@ -59,17 +46,15 @@ class MotorDC:
     where :math:`I` is the motor current [A], :math:`\\tau` the effort
     [N·m or N], :math:`k_t` is ``kt`` and :math:`R` is ``resistance``.
 
-    The command :math:`u` is the output of the drive, e.g. a
-    :class:`~newton.actuators.DriveVoltageControlled`, bounded by the
-    clampings, e.g. a :class:`~newton.actuators.ClampingCurrentPWM`, which
-    takes ``kt`` and ``resistance`` from this motor.
+    Standalone compute calls take average motor-terminal voltage. In a composed
+    actuator, the power stage converts the final signed duty to voltage before
+    invoking this motor. A DrivePD with kd=0 can supply duty proportional to
+    position error; ClampingCurrentDuty applies current and duty limits.
 
-    The motor is the last stage of an actuator, after the drive and the
-    clamping. It provides the supply voltage :math:`V` of the actuator: ``vin``,
-    or the battery voltage with ``supply_from_battery=True``. It then
-    reports the current :math:`d\\, I` it draws, with the duty cycle
-    :math:`d = u / V`, since the battery supplies the motor current only
-    during the PWM on-time (see :class:`~newton.actuators.BatteryBase`).
+    The fixed vin or connected battery provides actual supply voltage V.
+    The motor reports supply current d * I, where d = u / V for V > 0 and
+    d = 0 at zero voltage. Supply selection is handled by the power stage;
+    compute_supply_voltage remains available for standalone use and overrides.
 
     .. note::
 
@@ -188,7 +173,7 @@ class MotorDC:
         if self.uses_battery and (actuator_indices is None or battery_voltage is None):
             raise ValueError("MotorDC with supply_from_battery requires actuator_indices and the battery voltage.")
         wp.launch(
-            kernel=_motor_dc_supply_voltage_kernel,
+            kernel=_supply_voltage_kernel,
             dim=len(supply_voltage),
             inputs=[self.vin, self.supply_from_battery, battery_voltage, actuator_indices],
             outputs=[supply_voltage],

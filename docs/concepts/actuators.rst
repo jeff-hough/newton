@@ -40,11 +40,11 @@ An actuator is composed of four building blocks, applied in this order:
    ├── Drive      (control law that computes raw effort, or the motor command)
    ├── Clamping[]  (clamps raw effort to model actuator limits)
    │   ├── ClampingMaxEffort        (±max_effort symmetric clamp)
-   │   ├── ClampingCurrentPWM       (current and PWM limits of a servo firmware)
+   │   ├── ClampingCurrentDuty       (current and duty limits of a servo firmware)
    │   ├── ClampingDCMotor         (velocity-dependent saturation)
    │   └── ClampingPositionBased   (position-dependent lookup table)
    └── Motor       (optional: turns the motor command into the effort of a motor)
-       └── MotorDC                 (PWM-driven DC motor, optionally on a battery)
+       └── MotorDC                 (duty-driven DC motor, optionally on a battery)
 
 **Input processor**
    Transforms the inputs to the drive: the simulation state (positions,
@@ -60,10 +60,11 @@ An actuator is composed of four building blocks, applied in this order:
    PID and neural-network-based control.  See the individual drive class
    documentation for the control-law equations.
 
-   In an actuator with a motor, the drive computes the motor command
-   instead, e.g. the voltage of the firmware of a voltage-controlled servo
-   (:class:`DriveVoltageControlled`), and receives the supply voltage of the
-   motor.
+   In an actuator with a motor, the drive computes signed duty instead.
+   For example, :class:`DrivePD` with ``kd=0`` maps position error to duty.
+   Drives and clamps receive the same
+   :class:`ActuatorContext`, whose supply voltage is refreshed by the internal
+   power stage before evaluation.
 
 **Clamping**
    Clamps raw effort to model actuator limits.  Examples include saturation,
@@ -72,13 +73,13 @@ An actuator is composed of four building blocks, applied in this order:
    on a single actuator.
 
    A clamp limits the drive output.  With a motor, this is the motor command,
-   not the effort, e.g. the voltage that :class:`ClampingCurrentPWM` bounds by
-   the current and PWM limits of a servo firmware.  Such a clamp may take
+   not the effort, e.g. the duty that :class:`ClampingCurrentDuty` bounds by
+   the current and duty limits of a servo firmware.  Such a clamp may take
    parameters from the motor (:attr:`ClampingBase.MOTOR_PARAMS`), so they are
    authored once.
 
 **Motor**
-   Provides the supply voltage, and turns the motor command into the effort a
+   Turns the motor command into the effort a
    motor produces at the joint velocity, e.g. with back-EMF.  A motor may draw
    from a battery (see :ref:`actuator-battery`).  At most one motor per
    actuator; it always runs last.
@@ -642,9 +643,6 @@ Drives
   (stateful: position/velocity history buffers).
 * :class:`DriveNeuralLSTM` — LSTM neural-network drive
   (stateful: hidden/cell state).
-* :class:`DriveVoltageControlled` — firmware position controller of a
-  voltage-controlled servo as in BAM, which outputs a voltage for a motor
-  (stateless).
 
 See the API documentation for each drive's control-law equations.
 
@@ -652,8 +650,8 @@ Clamping
 ^^^^^^^^
 
 * :class:`ClampingMaxEffort` — symmetric clamp to ±max_effort per actuator.
-* :class:`ClampingCurrentPWM` — current and PWM limits of the firmware of a
-  servo as in BAM, on the voltage command of a :class:`MotorDC`, applied in
+* :class:`ClampingCurrentDuty` — current and duty limits of the firmware of a
+  servo as in BAM, on signed duty before the power stage, applied in
   this order.
 * :class:`ClampingDCMotor` — velocity-dependent effort saturation using the DC
   motor effort-speed characteristic.
@@ -666,10 +664,85 @@ in sequence.
 Motors
 ^^^^^^
 
-* :class:`MotorDC` — DC motor driven by a PWM voltage as in BAM (Better
+* :class:`MotorDC` — DC motor driven by an average terminal voltage as in BAM (Better
   Actuator Models): takes a voltage command and models the back-EMF,
   optionally on a battery.  It models the back-EMF itself, so do not combine
   it with :class:`ClampingDCMotor`.
+
+Shared physical context
+^^^^^^^^^^^^^^^^^^^^^^^
+
+An actuator with a motor prepares one :class:`ActuatorContext` before the drive
+and clamps run. It contains actual supply voltage, one value per actuator slot.
+Context provides shared physical inputs for this step; each component continues
+to own its internal state. Components must read the context arrays without
+modifying them. The arrays are reused between steps, so the context does not
+retain a history of their values. Commands still flow through the existing
+pipeline. The power stage selects fixed or battery voltage for the context and
+converts final duty to motor voltage, then motor effort. ``Actuator.step`` does not
+inspect clamp voltage settings. Without a motor, the ordinary effort pipeline
+runs without a power context.
+
+Existing ``motor=(MotorDC, ...)`` authoring, USD schemas and battery relationships
+remain supported. The powered pipeline now carries duty between the drive and
+clamps; the power stage multiplies duty by actual voltage before calling the
+motor. Standalone clamp calls can still pass ``supply_voltage``;
+when supplied, ``context`` takes precedence. Custom components used with a motor
+can accept the keyword-only ``context`` argument to consume physical inputs.
+Existing custom components that only accept ``supply_voltage`` continue receiving
+that array; the call convention is selected once when the actuator is constructed.
+Existing ``MotorDC.compute_supply_voltage`` overrides are also honored.
+
+``ClampingCurrentDuty.voltage_source`` explicitly selects the firmware's voltage
+estimate. Use ``ClampingCurrentDuty.VoltageSource.INPUT`` (the default) to read
+voltage from context or the standalone ``supply_voltage`` argument. Missing
+input raises an error; it does not fall back to a nominal value. Use
+``ClampingCurrentDuty.VoltageSource.NOMINAL`` with a positive ``nominal_voltage``
+to model firmware that assumes a fixed voltage. Supplying nominal voltage in
+INPUT mode is rejected so the selection is unambiguous.
+
+Both clamp input and output are dimensionless signed duty. Estimated voltage
+is used only for current limiting. The final duty bound is always
+``[-1, 1]``. When the selected voltage estimate is at or below ``v_min``
+(default: 1e-6 V), the current window is skipped to avoid division by a near-zero
+voltage, but the duty bound still applies. Configure the threshold using
+``v_min`` in clamp kwargs or ``float newton:vMin`` in USD. This threshold
+does not change the actual motor voltage. The power stage independently uses actual
+voltage to drive the motor; an inaccurate estimate or overspeed can exceed the
+current limit.
+
+For example, a builder clamp configuration can use either::
+
+    (ClampingCurrentDuty, {
+        "max_current": 2.0,
+        "voltage_source": ClampingCurrentDuty.VoltageSource.INPUT,
+    })
+    (ClampingCurrentDuty, {
+        "max_current": 2.0,
+        "voltage_source": ClampingCurrentDuty.VoltageSource.NOMINAL,
+        "nominal_voltage": 12.0,
+    })
+
+On the existing ``NewtonCurrentDutyClampingAPI``, USD authors can set
+``token newton:voltageSource = "nominal"`` and
+``float newton:nominalVoltage = 12``. The importer accepts these authored
+attributes even with schema packages predating them. Omitting both selects
+INPUT. Nominal voltage is per actuator; the voltage-source mode is shared within
+a component group, so different modes form separate groups.
+
+Use an ordinary ``DrivePD`` with ``kd=0`` for BAM's position-to-duty law.
+``kp`` has units of duty per position error. ``const_effort`` and feedforward,
+if used in this powered configuration, are also duty commands; leave them zero
+to reproduce the original position-only law. ``DriveVoltageControlled`` has
+been removed: its replacement has ``kp = old_kp * old_error_gain``. Existing
+``NewtonVoltageControlAPI`` USD assets are translated to that PD gain with
+``kd=0`` and still require a motor. Unlike the removed position-only drive,
+PD honors feedforward; existing assets must keep that input zero to retain the
+same behavior. New assets can use ``NewtonPDControlAPI`` directly. Direct
+``MotorDC.compute`` calls still take motor-terminal voltage.
+
+This change retains the existing battery update and motor equations. It does
+not add motor inductance or solve a shared battery current limit within a step.
 
 .. _actuator-battery:
 
@@ -687,7 +760,7 @@ entry per actuator of the model
 * input ``control.actuator_supply_current``: the current each motor draws
   from its battery, written by the motor in :meth:`Actuator.step`;
 * output ``control.actuator_supply_voltage``: the supply voltage of each
-  motor, read by the motor in the next :meth:`Actuator.step`.
+  motor, read by the power stage in the next :meth:`Actuator.step`.
 
 * :meth:`~newton.ModelBuilder.add_actuator` returns the index of the actuator
   in per-actuator arrays.  :meth:`~newton.ModelBuilder.add_battery` takes a
@@ -712,7 +785,7 @@ Below, the hip and knee share one battery and the ankle draws from another:
 .. testcode:: actuator-battery
 
    import newton
-   from newton.actuators import BatteryConstantResistance, ClampingCurrentPWM, DriveVoltageControlled, MotorDC
+   from newton.actuators import BatteryConstantResistance, ClampingCurrentDuty, DrivePD, MotorDC
 
    builder = newton.ModelBuilder()
    actuators = []
@@ -722,11 +795,11 @@ Below, the hip and knee share one battery and the ankle draws from another:
        joint = builder.add_joint_revolute(parent=-1, child=link, axis=newton.Axis.Z, label=name)
        builder.add_articulation([joint])
        actuator = builder.add_actuator(
-           DriveVoltageControlled,
+           DrivePD,
            index=builder.joint_qd_start[joint],
-           kp=5.0,
-           error_gain=0.1,
-           clamping=[(ClampingCurrentPWM, {"max_current": 2.0, "max_pwm": 0.9})],
+           kp=0.5,  # Duty per radian of position error.
+           kd=0.0,
+           clamping=[(ClampingCurrentDuty, {"max_current": 2.0})],
            motor=(MotorDC, {"kt": 0.5, "resistance": 2.0, "vin": 12.0, "supply_from_battery": True}),
        )
        actuators.append(actuator)

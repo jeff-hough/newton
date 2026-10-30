@@ -3352,7 +3352,9 @@ class ModelBuilder:
                 take a joint index or a joint label; ``None`` selects the
                 actuated joint.
             motor: Optional ``(MotorClass, kwargs)`` tuple applied after the
-                clamping. E.g. ``(MotorDC, {"kt": 1.0, "resistance": 2.0, "vin": 12.0})``.
+                clamping. With MotorDC, the drive and clamps output signed duty;
+                the power stage converts it to motor voltage. E.g.
+                ``(MotorDC, {"kt": 1.0, "resistance": 2.0, "vin": 12.0})``.
             controller_class: Deprecated in Newton 1.6; use ``drive_class`` instead.
             **kwargs: Per-DOF drive parameters (e.g. ``kp``, ``kd``).
 
@@ -3366,8 +3368,7 @@ class ModelBuilder:
                 processor does not identify a single-DOF joint of the current
                 world or a global joint, of the same type as the actuated joint,
                 a clamping takes parameters from a motor that does not have them (see
-                :attr:`~newton.actuators.ClampingBase.MOTOR_PARAMS`), or a
-                :class:`~newton.actuators.DriveVoltageControlled` has no motor.
+                :attr:`~newton.actuators.ClampingBase.MOTOR_PARAMS`), or incompatible motor parameters are supplied.
         """
         if controller_class is not _DEPRECATED_ACTUATOR_DRIVE_UNSET:
             if drive_class is not None:
@@ -3478,10 +3479,6 @@ class ModelBuilder:
                     f"add_actuator: {comp_class.__name__} takes {', '.join(sorted(missing))} from the motor, "
                     "which requires a motor with these parameters"
                 )
-        from ..actuators.drives.drive_voltage_controlled import DriveVoltageControlled  # noqa: PLC0415
-
-        if issubclass(drive_class, DriveVoltageControlled) and motor is None:
-            raise ValueError(f"add_actuator: {drive_class.__name__} requires a motor, such as MotorDC")
 
         # --- Build entry key: identifies a group of compatible actuators ---
         # Groups differ when drive class, input processor types/shared-params,

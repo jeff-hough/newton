@@ -72,9 +72,9 @@ class BatteryConstantResistance(BatteryBase):
 
     The supply and the motors form an explicit feedback loop. For a
     :class:`~newton.actuators.MotorDC` behind a
-    :class:`~newton.actuators.DriveVoltageControlled` and a
-    :class:`~newton.actuators.ClampingCurrentPWM` without an active current
-    limit, it settles while ``resistance * sum(max_pwm**2 / motor resistance)
+    duty-output :class:`~newton.actuators.DrivePD` (with ``kd=0``) and a
+    :class:`~newton.actuators.ClampingCurrentDuty` without an active current
+    limit, it settles while ``resistance * sum(1 / motor resistance)
     < 1`` over the actuators sharing a battery; above that bound, or while a
     current limit is active, the voltage may oscillate instead of
     converging.

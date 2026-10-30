@@ -7,6 +7,8 @@ from typing import Any, ClassVar
 
 import warp as wp
 
+from ..context import ActuatorContext
+
 
 class ClampingBase:
     """Base class for actuator output effort clamping.
@@ -15,8 +17,8 @@ class ClampingBase:
     actuator output effort — symmetric limits, velocity-dependent
     saturation, position-dependent curves, etc.  They read from a
     source effort buffer and write bounded values to a destination buffer.
-    In an actuator with a motor, they bound the motor command instead (e.g.
-    a voltage for :class:`~newton.actuators.MotorDC`).
+    In an actuator with a motor, they bound signed duty instead. Gains and
+    limits must use the same units as the drive output.
 
     **Validation contract:**  :meth:`resolve_arguments` validates scalar
     parameter values before they are batched into Warp arrays.
@@ -95,6 +97,7 @@ class ClampingBase:
         device: wp.Device | None = None,
         *,
         supply_voltage: wp.array[float] | None = None,
+        context: ActuatorContext | None = None,
     ) -> None:
         """Read effort from *src*, apply clamping, write to *dst*.
 
@@ -111,9 +114,11 @@ class ClampingBase:
             pos_indices: Indices into *positions* for each DOF.
             vel_indices: Indices into *velocities* for each DOF.
             device: Warp device for kernel launches.
-            supply_voltage: Supply voltage of each slot [V], from the
-                actuator's motor (see :meth:`MotorDC.compute_supply_voltage
-                <newton.actuators.MotorDC.compute_supply_voltage>`). Shape
-                ``(N,)``. Only passed when the actuator has a motor.
+            supply_voltage: Supply voltage [V], shape (N,), for standalone
+                calls. Prefer *context* in composed actuators.
+            context: Physical inputs shared by the drive and clamps for this
+                step, provided when the actuator has a power stage. Components
+                must not modify its arrays. If both arguments are supplied,
+                voltage is read from *context*, not *supply_voltage*.
         """
         raise NotImplementedError(f"{type(self).__name__} must implement modify_forces")

@@ -34,6 +34,7 @@ import numpy as np
 import warp as wp
 
 from ..sim import JointType
+from .context import ActuatorContext
 from .drives.base import DriveBase
 from .joint_space_response import JointSpaceResponse
 
@@ -945,7 +946,7 @@ class _EffortModeImplicit:
         dt: float | None,
         custom_inputs: dict[str, Any] | None = None,
         bias_force: wp.array[float] | None = None,
-        supply_voltage: wp.array[float] | None = None,
+        context: ActuatorContext | None = None,
     ) -> wp.array[float]:
         """Solve implicit effort and return the applied-effort buffer.
 
@@ -963,7 +964,7 @@ class _EffortModeImplicit:
         predicted end-of-step velocity is ``qd + A (p - h bias_force)`` instead
         of ``qd + A p``.
 
-        *supply_voltage* is ignored, since implicit actuation does not support
+        *context* is ignored, since implicit actuation does not support
         motors.
         """
         if dt is None:

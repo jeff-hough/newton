@@ -82,11 +82,11 @@ def Xform "World"
             uniform token physics:axis = "Z"
         }
 
-        # Knee servo: voltage control + current/PWM limits + DC motor + delay + encoder, on the battery
+        # Knee servo: voltage control + current/duty limits + DC motor + delay + encoder, on the battery
         def NewtonActuator "knee_actuator" (
             prepend apiSchemas = [
                 "NewtonVoltageControlAPI",
-                "NewtonCurrentPWMClampingAPI",
+                "NewtonCurrentDutyClampingAPI",
                 "NewtonDCMotorAPI",
                 "NewtonActuatorDelayAPI",
                 "NewtonActuatorEncoderAPI",
@@ -101,16 +101,15 @@ def Xform "World"
             float newton:kt = 0.6
             float newton:resistance = 2.0
             float newton:vin = 6.0
-            float newton:maxPwm = 0.9
             float newton:maxCurrent = 1.0
             int newton:delaySteps = 2
         }
 
-        # Ankle servo: voltage control + current/PWM limits + DC motor + delay, on the battery
+        # Ankle servo: voltage control + current/duty limits + DC motor + delay, on the battery
         def NewtonActuator "ankle_actuator" (
             prepend apiSchemas = [
                 "NewtonVoltageControlAPI",
-                "NewtonCurrentPWMClampingAPI",
+                "NewtonCurrentDutyClampingAPI",
                 "NewtonDCMotorAPI",
                 "NewtonActuatorDelayAPI",
             ]
@@ -123,16 +122,15 @@ def Xform "World"
             float newton:kt = 0.6
             float newton:resistance = 2.0
             float newton:vin = 6.0
-            float newton:maxPwm = 0.9
             float newton:maxCurrent = 1.0
             int newton:delaySteps = 2
         }
 
-        # Toe servo: voltage control + current/PWM limits + DC motor + delay, fixed supply vin
+        # Toe servo: voltage control + current/duty limits + DC motor + delay, fixed supply vin
         def NewtonActuator "toe_actuator" (
             prepend apiSchemas = [
                 "NewtonVoltageControlAPI",
-                "NewtonCurrentPWMClampingAPI",
+                "NewtonCurrentDutyClampingAPI",
                 "NewtonDCMotorAPI",
                 "NewtonActuatorDelayAPI",
             ]
@@ -144,7 +142,6 @@ def Xform "World"
             float newton:kt = 0.6
             float newton:resistance = 2.0
             float newton:vin = 5.0
-            float newton:maxPwm = 0.9
             float newton:maxCurrent = 1.0
             int newton:delaySteps = 2
         }

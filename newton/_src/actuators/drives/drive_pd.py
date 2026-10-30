@@ -7,6 +7,7 @@ from typing import Any
 
 import warp as wp
 
+from ..context import ActuatorContext
 from .base import DriveBase
 
 
@@ -68,7 +69,13 @@ def _pd_effort_kernel(
 class DrivePD(DriveBase):
     """Stateless proportional-derivative actuator drive.
 
-    Effort law::
+    The output is effort for an ordinary actuator, or signed duty when a DC
+    power stage is attached. Gains and feedforward must use that output's units.
+    For position-to-duty control, set kd=0, use kp in [1/rad or 1/m], and leave
+    const_effort and feedforward zero. To migrate from DriveVoltageControlled,
+    use its firmware kp multiplied by error_gain as the new kp.
+
+    Control law::
 
         effort = const_effort + feedforward + kp * (target_pos - current_pos) + kd * (target_vel - current_vel)
     """
@@ -92,9 +99,12 @@ class DrivePD(DriveBase):
         """Initialize the PD drive.
 
         Args:
-            kp: Proportional gains [N/m or N·m/rad]. Shape ``(N,)``.
-            kd: Derivative gains [N·s/m or N·m·s/rad]. Shape ``(N,)``.
-            const_effort: Constant bias effort [N or N·m]. Shape ``(N,)``. ``None`` to skip.
+            kp: Proportional gains [N/m or N·m/rad] for effort output,
+                or [1/m or 1/rad] for duty output. Shape ``(N,)``.
+            kd: Derivative gains [N·s/m or N·m·s/rad] for effort output,
+                or [s/m or s/rad] for duty output. Shape ``(N,)``.
+            const_effort: Constant output bias [N or N·m] for effort output,
+                or dimensionless for duty output. Shape ``(N,)``. ``None`` to skip.
         """
         if kp.shape != kd.shape:
             raise ValueError(f"kp shape {kp.shape} must match kd shape {kd.shape}")
@@ -151,6 +161,7 @@ class DrivePD(DriveBase):
         *,
         custom_inputs: dict[str, Any] | None = None,
         supply_voltage: wp.array[float] | None = None,
+        context: ActuatorContext | None = None,
     ) -> None:
         wp.launch(
             kernel=_pd_effort_kernel,

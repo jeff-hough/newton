@@ -29,10 +29,11 @@ from newton._src.actuators.utils import load_metadata
 from newton._src.utils.import_usd import parse_usd
 from newton.actuators import (
     Actuator,
+    ActuatorContext,
     ActuatorParsed,
     BatteryConstantResistance,
     ClampingBase,
-    ClampingCurrentPWM,
+    ClampingCurrentDuty,
     ClampingDCMotor,
     ClampingMaxEffort,
     ClampingPositionBased,
@@ -42,7 +43,6 @@ from newton.actuators import (
     DriveNeuralMLP,
     DrivePD,
     DrivePID,
-    DriveVoltageControlled,
     InputProcessorBase,
     InputProcessorDelay,
     InputProcessorEncoder,
@@ -1069,10 +1069,12 @@ class TestDriveNeuralGRU(unittest.TestCase):
             pos_indices=case.actuator.pos_indices,
             target_pos_indices=case.actuator.target_pos_indices,
             drive=DriveNeuralGRU(path),
-            delay=Delay(
-                delay_steps=wp.full(3, 1, dtype=wp.int32, device=self.device),
-                max_delay=1,
-            ),
+            input_processors=[
+                InputProcessorDelay(
+                    delay_steps=wp.full(3, 1, dtype=wp.int32, device=self.device),
+                    max_delay=1,
+                )
+            ],
         )
         case.state_a = case.actuator.state()
         case.state_b = case.actuator.state()
@@ -2735,6 +2737,48 @@ class TestMotorDC(unittest.TestCase):
         self.assertLess(forces.numpy()[2], 0.0)
         np.testing.assert_allclose(supply_current.numpy(), (np.array(commanded) / supply * current)[::-1], rtol=1e-5)
 
+    def test_custom_power_components(self):
+        """Preserve custom voltage keywords and motor supply-selection overrides.
+
+        The custom motor selects its fixed voltage instead of battery voltage.
+        The drive accepts **kwargs but only reads supply_voltage; the clamp
+        accepts supply_voltage without **kwargs. Both must retain their inputs.
+        """
+
+        class VoltageDrive(DrivePD):
+            def compute(self, *args, supply_voltage=None, **kwargs):
+                super().compute(*args, supply_voltage=supply_voltage)
+
+        class VoltageClamp(ClampingCurrentDuty):
+            def modify_forces(self, *args, device=None, supply_voltage=None):
+                super().modify_forces(*args, device=device, supply_voltage=supply_voltage)
+
+        class RegulatedMotor(MotorDC):
+            def compute_supply_voltage(self, battery_voltage, actuator_indices, supply_voltage, device=None):
+                wp.copy(supply_voltage, self.vin)
+
+        builder = newton.ModelBuilder()
+        body = builder.add_link()
+        joint = builder.add_joint_revolute(parent=-1, child=body, axis=newton.Axis.Z)
+        slot = builder.add_actuator(
+            VoltageDrive,
+            index=builder.joint_qd_start[joint],
+            kp=0.5,
+            clamping=[(VoltageClamp, {})],
+            motor=(RegulatedMotor, {"kt": 0.5, "resistance": 2.0, "vin": 6.0, "supply_from_battery": True}),
+        )
+        builder.add_battery(BatteryConstantResistance, [slot], nominal_voltage=12.0)
+        model = builder.finalize()
+        actuator = model.actuators[0]
+        state, control = model.state(), model.control()
+        control.joint_target_q.fill_(1.0)
+        for _ in range(2):
+            control.joint_f.zero_()
+            actuator.step(state, control, dt=0.01)
+            np.testing.assert_allclose(control.joint_f.numpy(), [0.75])
+            np.testing.assert_allclose(control.actuator_supply_current.numpy(), [0.75])
+            actuator.set_effort_mode_explicit()
+
     def test_battery_supply(self):
         """Each servo reads the voltage its battery dropped to under the previous step's current.
 
@@ -2750,7 +2794,7 @@ class TestMotorDC(unittest.TestCase):
         its own batteries, and a masked reset restores the nominal voltage of
         world 0 only.
         """
-        kp, kt, resistance, vin, max_pwm, target, dt = 0.5, 0.6, 2.0, 6.0, 0.9, 1.0, 0.01
+        kp, kt, resistance, vin, target, dt = 0.5, 0.6, 2.0, 6.0, 1.0, 0.01
         nominal_voltage, min_voltage, battery_resistance = np.array([6.0, 4.0]), np.array([5.4, 3.0]), 1.0
         template = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
         links = [template.add_link(mass=1.0, inertia=_POINT_MASS_INERTIA) for _ in range(3)]
@@ -2770,16 +2814,16 @@ class TestMotorDC(unittest.TestCase):
         knee, ankle = template.joint_qd_start[joints[0]], template.joint_qd_start[joints[2]]
         servo = {
             "kp": kp,
-            "clamping": [(ClampingCurrentPWM, {"max_pwm": max_pwm})],
+            "clamping": [(ClampingCurrentDuty, {})],
             "motor": (MotorDC, {"kt": kt, "resistance": resistance, "vin": vin, "supply_from_battery": True}),
         }
         knee_servo = template.add_actuator(
-            DriveVoltageControlled,
+            DrivePD,
             index=knee,
             input_processors=[(InputProcessorEncoder, {"output_joint": "backlash"})],
             **servo,
         )
-        ankle_servos = [template.add_actuator(DriveVoltageControlled, index=ankle, **servo) for _ in range(2)]
+        ankle_servos = [template.add_actuator(DrivePD, index=ankle, **servo) for _ in range(2)]
         for servos, nominal, minimum in zip(
             ([knee_servo, ankle_servos[0]], [ankle_servos[1]]), nominal_voltage, min_voltage, strict=True
         ):
@@ -2810,7 +2854,7 @@ class TestMotorDC(unittest.TestCase):
         knees = dof % template.joint_dof_count == knee
         measured = q[dof]
         measured[knees] += q[dof[knees] + 1]
-        duty = np.clip(kp * (target - measured), -max_pwm, max_pwm)
+        duty = np.clip(kp * (target - measured), -1.0, 1.0)
         nominal, minimum = np.tile(nominal_voltage, 2), np.tile(min_voltage, 2)
 
         drawn = np.zeros(4)
@@ -3073,18 +3117,18 @@ class TestInputProcessors(unittest.TestCase):
 # ---------------------------------------------------------------------------
 
 
-class TestClampingCurrentPWM(unittest.TestCase):
-    """ClampingCurrentPWM: current limit, then PWM limit, with the motor's kt and resistance."""
+class TestClampingCurrentDuty(unittest.TestCase):
+    """ClampingCurrentDuty: current limit, then duty limit, with the motor's kt and resistance."""
 
     def test_modify_forces(self):
         """Construct the clamp directly and call modify_forces() with each limit.
 
         Slot 0 is within both limits, slot 1 is narrowed by the current limit,
-        slot 2 is clamped by ``max_pwm``, and slot 3 overspeeds: its current
-        window lies above the PWM limit, so the PWM limit wins.
+        slot 2 is clamped to -1, and slot 3 overspeeds: its current
+        window lies above the duty limit, so the duty limit wins.
         """
-        kt, resistance, max_current, max_pwm, voltage = 0.5, 2.0, 1.0, 0.9, 10.0
-        commanded = [1.0, 6.0, -20.0, 0.0]
+        kt, resistance, max_current, voltage = 0.5, 2.0, 1.0, 10.0
+        commanded = [0.1, 0.6, -2.0, 0.0]
         qd = [0.5, -1.0, 2.0, 30.0]
         n = len(commanded)
 
@@ -3092,9 +3136,8 @@ class TestClampingCurrentPWM(unittest.TestCase):
             return wp.array(vals, dtype=wp.float32)
 
         indices = wp.array(list(range(n)), dtype=wp.uint32)
-        clamp = ClampingCurrentPWM(
+        clamp = ClampingCurrentDuty(
             max_current=_f([max_current, max_current, 0.0, max_current]),
-            max_pwm=_f([max_pwm] * n),
             kt=_f([kt] * n),
             resistance=_f([resistance] * n),
         )
@@ -3110,27 +3153,181 @@ class TestClampingCurrentPWM(unittest.TestCase):
             supply_voltage=_f([voltage] * n),
         )
 
-        np.testing.assert_allclose(dst.numpy(), [1.0, 1.5, -9.0, 9.0], rtol=1e-5)
+        np.testing.assert_allclose(dst.numpy(), [0.1, 0.15, -1.0, 1.0], rtol=1e-5)
+
+    def test_voltage_estimate(self):
+        """Select input or nominal sensing while the power stage uses actual voltage.
+
+        Run the full PD-to-duty-to-torque pipeline on CPU and CUDA. Include
+        zero supply, overspeed, gradients, and graph replay with changed supply.
+        """
+        source = ClampingCurrentDuty.VoltageSource
+        for device in wp.get_devices():
+            for mode in source:
+                with self.subTest(device=device, mode=mode), wp.ScopedDevice(device):
+
+                    def array(values):
+                        return wp.array(values, dtype=float, requires_grad=True)
+
+                    supply = array([10.0, 10.0, 10.0, 0.0, 10.0])
+                    indices = wp.array(list(range(5)), dtype=wp.uint32)
+                    motor = MotorDC(
+                        kt=array([0.5] * 5),
+                        resistance=array([2.0] * 5),
+                        vin=supply,
+                        supply_from_battery=wp.ones(5, dtype=float),
+                    )
+                    clamp = ClampingCurrentDuty(
+                        max_current=array([1.0] * 5),
+                        kt=motor.kt,
+                        resistance=motor.resistance,
+                        voltage_source=mode,
+                        nominal_voltage=array([10.0, 5.0, 20.0, 10.0, 10.0]) if mode is source.NOMINAL else None,
+                    )
+                    drive = DrivePD(kp=array([0.6] * 5), kd=array([0.0] * 5))
+                    actuator = Actuator(
+                        indices=indices,
+                        drive=drive,
+                        clamping=[clamp],
+                        motor=motor,
+                        actuator_indices=indices,
+                        requires_grad=True,
+                    )
+                    state, control = actuator.sim_state(), actuator.sim_control()
+                    state.joint_q = wp.zeros(5, dtype=float)
+                    state.joint_qd = array([0.0, 0.0, 0.0, 4.0, 30.0])
+                    control.joint_target_q = wp.ones(5, dtype=float)
+                    control.joint_target_qd = wp.zeros(5, dtype=float)
+                    control.joint_f = wp.zeros(5, dtype=float, requires_grad=True)
+                    control.actuator_supply_voltage = supply
+                    control.actuator_supply_current = wp.zeros(5, dtype=float, requires_grad=True)
+                    nominal = mode is source.NOMINAL
+                    with wp.Tape() as tape:
+                        actuator.step(state, control, dt=0.01)
+                    expected = [0.5, 1.0, 0.25, -0.5, -1.25] if nominal else [0.5, 0.5, 0.5, -0.5, -1.25]
+                    np.testing.assert_allclose(control.joint_f.numpy(), expected, atol=1e-6)
+                    expected_current = [0.2, 0.8, 0.05, 0.0, -2.5] if nominal else [0.2, 0.2, 0.2, 0.0, -2.5]
+                    np.testing.assert_allclose(control.actuator_supply_current.numpy(), expected_current, atol=1e-6)
+                    tape.backward(grads={control.joint_f: wp.ones(5, dtype=float)})
+                    expected_grad = [0.05, 0.1, 0.025, 0.25] if nominal else [0.0, 0.0, 0.0, 0.25]
+                    np.testing.assert_allclose(supply.grad.numpy()[[0, 1, 2, 4]], expected_grad, atol=1e-6)
+                    if device.is_cuda:
+                        with wp.ScopedCapture() as capture:
+                            control.joint_f.zero_()
+                            actuator.step(state, control, dt=0.01)
+                        supply.assign([5.0, 5.0, 5.0, 0.0, 5.0])
+                        wp.capture_launch(capture.graph)
+                        expected = [0.25, 0.5, 0.125, -0.5, -2.5] if nominal else [0.5, 0.5, 0.5, -0.5, -2.5]
+                        np.testing.assert_allclose(control.joint_f.numpy(), expected, atol=1e-6)
+
+    def test_voltage_source_validation(self):
+        """Require the selected voltage source without silently using another source."""
+        source = ClampingCurrentDuty.VoltageSource
+        for invalid in (None, 0.0, -1.0, float("nan"), float("inf")):
+            with self.subTest(invalid=invalid), self.assertRaisesRegex(ValueError, "nominal_voltage"):
+                ClampingCurrentDuty.resolve_arguments({"voltage_source": source.NOMINAL, "nominal_voltage": invalid})
+        for invalid in (0.0, -1.0, float("nan"), float("inf")):
+            with self.subTest(v_min=invalid), self.assertRaisesRegex(ValueError, "v_min"):
+                ClampingCurrentDuty.resolve_arguments({"v_min": invalid})
+        with self.assertRaisesRegex(ValueError, "nominal_voltage"):
+            ClampingCurrentDuty.resolve_arguments({"voltage_source": source.INPUT, "nominal_voltage": 12.0})
+        with self.assertRaises(ValueError):
+            ClampingCurrentDuty.resolve_arguments({"voltage_source": "unknown"})
+
+        def array(values):
+            return wp.array(values, dtype=float)
+
+        params = {"max_current": array([1.0]), "kt": array([0.5]), "resistance": array([2.0])}
+        indices = wp.array([0], dtype=wp.uint32)
+        positions = array([0.0])
+        command, result = array([0.8]), array([0.0])
+        nominal = ClampingCurrentDuty(**params, voltage_source=source.NOMINAL, nominal_voltage=array([10.0]))
+        nominal.modify_forces(command, result, positions, positions, indices, indices)
+        np.testing.assert_allclose(result.numpy(), [0.2])
+        # Even a different supplied voltage must not override NOMINAL mode.
+        nominal.modify_forces(command, result, positions, positions, indices, indices, supply_voltage=array([5.0]))
+        np.testing.assert_allclose(result.numpy(), [0.2])
+        live = ClampingCurrentDuty(**params, voltage_source=source.INPUT)
+        with self.assertRaisesRegex(ValueError, "INPUT"):
+            live.modify_forces(command, result, positions, positions, indices, indices)
+        with self.assertRaisesRegex(ValueError, "INPUT"):
+            live.modify_forces(
+                command,
+                result,
+                positions,
+                positions,
+                indices,
+                indices,
+                context=ActuatorContext(),
+                supply_voltage=array([10.0]),
+            )
+        live.modify_forces(command, result, positions, positions, indices, indices, supply_voltage=array([5.0]))
+        np.testing.assert_allclose(result.numpy(), [0.4])
+        live.modify_forces(command, result, positions, positions, indices, indices, supply_voltage=array([0.0]))
+        np.testing.assert_allclose(result.numpy(), [0.8])
+        # Use back EMF to make the current window change duty even at low voltage.
+        # At and below the threshold, only the fixed duty bound should apply.
+        threshold = ClampingCurrentDuty(**params, v_min=array([0.5]))
+        command.assign([-2.0])
+        velocity = array([6.0])
+        for voltage, expected in ((0.0, -1.0), (0.25, -1.0), (0.5, -1.0), (0.75, 1.0)):
+            with self.subTest(voltage=voltage):
+                threshold.modify_forces(
+                    command, result, positions, velocity, indices, indices, supply_voltage=array([voltage])
+                )
+                np.testing.assert_allclose(result.numpy(), [expected])
+        nominal_threshold = ClampingCurrentDuty(
+            **params, voltage_source=source.NOMINAL, nominal_voltage=array([0.25]), v_min=array([0.5])
+        )
+        nominal_threshold.modify_forces(command, result, positions, velocity, indices, indices)
+        np.testing.assert_allclose(result.numpy(), [-1.0])
+        with self.assertRaisesRegex(ValueError, "shape"):
+            ClampingCurrentDuty(**params, v_min=array([0.5, 0.5]))
+        with self.assertRaisesRegex(ValueError, "shape"):
+            live.modify_forces(
+                command, result, positions, positions, indices, indices, supply_voltage=array([5.0, 5.0])
+            )
+        with self.assertRaisesRegex(ValueError, "NOMINAL"):
+            ClampingCurrentDuty(**params, voltage_source=source.NOMINAL)
+        with self.assertRaisesRegex(ValueError, "NOMINAL"):
+            ClampingCurrentDuty(**params, nominal_voltage=array([10.0]))
 
     def test_motor_params(self):
         """The builder passes the motor's kt and resistance arrays, and requires a motor that has them."""
         builder = newton.ModelBuilder()
         link = builder.add_link()
         joint = builder.add_joint_revolute(parent=-1, child=link, axis=newton.Axis.Z)
-        clamping = [(ClampingCurrentPWM, {"max_current": 1.0})]
+        clamping = [
+            (
+                ClampingCurrentDuty,
+                {
+                    "max_current": 1.0,
+                    "voltage_source": ClampingCurrentDuty.VoltageSource.NOMINAL,
+                    "nominal_voltage": 12.0,
+                    "v_min": 0.5,
+                },
+            )
+        ]
         with self.assertRaisesRegex(ValueError, "kt, resistance from the motor"):
-            builder.add_actuator(DriveVoltageControlled, index=builder.joint_qd_start[joint], kp=1.0, clamping=clamping)
+            builder.add_actuator(DrivePD, index=builder.joint_qd_start[joint], kp=1.0, clamping=clamping)
         builder.add_actuator(
-            DriveVoltageControlled,
+            DrivePD,
             index=builder.joint_qd_start[joint],
             kp=1.0,
             clamping=clamping,
             motor=(MotorDC, {"kt": 0.5, "resistance": 2.0, "vin": 12.0}),
         )
-        (actuator,) = builder.finalize().actuators
+        model = builder.finalize()
+        (actuator,) = model.actuators
         (clamp,) = actuator.clamping
         self.assertIs(clamp.kt, actuator.motor.kt)
         self.assertIs(clamp.resistance, actuator.motor.resistance)
+        np.testing.assert_array_equal(clamp.nominal_voltage.numpy(), [12.0])
+        np.testing.assert_array_equal(clamp.v_min.numpy(), [0.5])
+        state, control = model.state(), model.control()
+        control.joint_target_q.fill_(1.0)
+        actuator.step(state, control, dt=0.01)
+        np.testing.assert_allclose(control.joint_f.numpy(), [0.5])
 
 
 class TestClampingMaxEffort(unittest.TestCase):
@@ -5287,7 +5484,7 @@ class TestActuatorBuilder(unittest.TestCase):
         """Servos with a DC motor, a delay, backlash and a battery, loaded from USD and replicated.
 
         The asset has three servos with voltage control for a BAM duty cycle
-        of ``0.5 * error``, current and PWM limits, a DC motor and a 2-step
+        of ``0.5 * error``, current and duty limits, a DC motor and a 2-step
         delay:
           knee_actuator: backlash hinge in series, draws from Battery
           ankle_actuator: draws from Battery
@@ -5298,8 +5495,14 @@ class TestActuatorBuilder(unittest.TestCase):
         reads ``q_knee + q_backlash``. Battery has no ``newton:minVoltage``,
         and SpareBattery has no actuators, so it is not imported.
         """
+        from pxr import Sdf
+
         usd_path = os.path.join(os.path.dirname(__file__), "assets", "actuator_bam_test.usda")
         stage = Usd.Stage.Open(usd_path)
+        ankle_prim = stage.GetPrimAtPath("/World/Robot/ankle_actuator")
+        ankle_prim.CreateAttribute("newton:voltageSource", Sdf.ValueTypeNames.Token).Set("nominal")
+        ankle_prim.CreateAttribute("newton:nominalVoltage", Sdf.ValueTypeNames.Float).Set(12.0)
+        ankle_prim.CreateAttribute("newton:vMin", Sdf.ValueTypeNames.Float).Set(0.5)
         battery = parse_battery_prim(stage.GetPrimAtPath("/World/Robot/Battery"))
         self.assertIs(battery.battery_class, BatteryConstantResistance)
         self.assertEqual(battery.battery_kwargs, {"nominal_voltage": 6.0, "resistance": 0.5})
@@ -5309,7 +5512,11 @@ class TestActuatorBuilder(unittest.TestCase):
         builder.replicate(template, 2)
         model = builder.finalize()
 
-        self.assertEqual(len(model.actuators), 2)
+        self.assertEqual(len(model.actuators), 3)
+        for actuator in model.actuators:
+            for clamp in actuator.clamping:
+                if isinstance(clamp, ClampingCurrentDuty) and clamp.voltage_source is clamp.VoltageSource.NOMINAL:
+                    np.testing.assert_array_equal(clamp.v_min.numpy(), [0.5, 0.5])
         (batteries,) = model.batteries
         np.testing.assert_array_equal(batteries.actuator_start.numpy(), [0, 2, 4])
         np.testing.assert_array_equal(batteries.actuators.numpy(), [0, 1, 3, 4])
@@ -5339,10 +5546,19 @@ class TestActuatorBuilder(unittest.TestCase):
                 actuator.step(state, control, current, nxt, dt=0.01)
             states = [(actuator, nxt, current) for actuator, current, nxt in states]
 
-            duty = np.clip(0.5 * (targets[max(step - 2, 0)] - measured), -2.0 / supply, 2.0 / supply)
-            duty = np.clip(duty, -0.9, 0.9)
+            # The ankle firmware assumes 12 V even though its source supplies 6 V.
+            estimate = np.tile([6.0, 12.0, 5.0], 2)
+            duty = np.clip(0.5 * (targets[max(step - 2, 0)] - measured), -2.0 / estimate, 2.0 / estimate)
+            duty = np.clip(duty, -1.0, 1.0)
             expected = 0.6 * supply * duty / 2.0
             np.testing.assert_allclose(control.joint_f.numpy()[dof], expected, rtol=1e-5, err_msg=f"step {step}")
+
+        # The legacy duty-control schema must not silently become torque PD
+        # if its motor is removed from the asset.
+        toe_prim = stage.GetPrimAtPath("/World/Robot/toe_actuator")
+        toe_prim.SetMetadata("apiSchemas", Sdf.TokenListOp.CreateExplicit(["NewtonVoltageControlAPI"]))
+        with self.assertRaisesRegex(ValueError, "requires a motor"):
+            parse_actuator_prim(toe_prim)
 
     @unittest.skipUnless(HAS_USD, "pxr not installed")
     def test_usd_unknown_actuator_schema_warns(self):

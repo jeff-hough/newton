@@ -9,6 +9,7 @@ from typing import Any
 
 import warp as wp
 
+from ..context import ActuatorContext
 from .base import DriveBase, _masked_zero_1d
 
 
@@ -297,6 +298,7 @@ class DrivePID(DriveBase):
         *,
         custom_inputs: dict[str, Any] | None = None,
         supply_voltage: wp.array[float] | None = None,
+        context: ActuatorContext | None = None,
     ) -> None:
         wp.launch(
             kernel=_pid_effort_kernel,

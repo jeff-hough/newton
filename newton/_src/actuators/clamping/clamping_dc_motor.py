@@ -10,6 +10,7 @@ from typing import Any
 import warp as wp
 
 from ...exceptions import NewtonDeprecationWarning
+from ..context import ActuatorContext
 from .base import ClampingBase
 
 
@@ -210,6 +211,7 @@ class ClampingDCMotor(ClampingBase):
         device: wp.Device | None = None,
         *,
         supply_voltage: wp.array[float] | None = None,
+        context: ActuatorContext | None = None,
     ) -> None:
         wp.launch(
             kernel=_clamp_dc_motor_kernel,

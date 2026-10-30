@@ -9,6 +9,7 @@ from typing import Any, ClassVar
 import numpy as np
 import warp as wp
 
+from ..context import ActuatorContext
 from .base import ClampingBase
 
 
@@ -273,6 +274,7 @@ class ClampingPositionBased(ClampingBase):
         device: wp.Device | None = None,
         *,
         supply_voltage: wp.array[float] | None = None,
+        context: ActuatorContext | None = None,
     ) -> None:
         wp.launch(
             kernel=_position_based_clamp_kernel,

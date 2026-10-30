@@ -14,13 +14,13 @@ import warp as wp
 from ..exceptions import NewtonDeprecationWarning, NewtonWarning
 from .clamping.base import ClampingBase
 from .drives.base import DriveBase
-from .drives.drive_voltage_controlled import DriveVoltageControlled
 from .effort_mode_explicit import _EffortModeExplicit
 from .effort_mode_implicit import ImplicitOptions, JointSpaceResponse, _EffortModeImplicit
 from .input_processors.base import InputProcessorBase
 from .input_processors.input_processor_delay import InputProcessorDelay
 from .input_processors.input_processor_encoder import InputProcessorEncoder
 from .motor_dc import MotorDC
+from .power_stage import _PowerStageDC
 
 if TYPE_CHECKING:
     from ..sim.builder import ModelBuilder
@@ -136,6 +136,14 @@ def _assign_component_state(dst: Any, src: Any, name: str) -> None:
         _assign_state_value(getattr(dst, field.name), getattr(src, field.name), f"{name}.{field.name}")
 
 
+def _legacy_delay_updates(processors: list[InputProcessorBase]) -> list[InputProcessorDelay]:
+    """Return the delays whose ``update_state`` override still takes the deprecated 7-argument form."""
+    legacy = [p for p in processors if isinstance(p, InputProcessorDelay) and p._overrides_legacy_update_state()]
+    if legacy:
+        warnings.warn(_DELAY_UPDATE_STATE_OVERRIDE_DEPRECATION_MSG, NewtonDeprecationWarning, stacklevel=3)
+    return legacy
+
+
 _MISSING = object()
 
 
@@ -201,14 +209,6 @@ def _input_container_class(name: str, frequencies: tuple[tuple[str, Model.Attrib
     )
     cls.__doc__ = f"Arrays an actuator reads from ``{name}``: {', '.join(frequency_of)}."
     return cls
-
-
-def _legacy_delay_updates(processors: list[InputProcessorBase]) -> list[InputProcessorDelay]:
-    """Return the delays whose ``update_state`` override still takes the deprecated 7-argument form."""
-    legacy = [p for p in processors if isinstance(p, InputProcessorDelay) and p._overrides_legacy_update_state()]
-    if legacy:
-        warnings.warn(_DELAY_UPDATE_STATE_OVERRIDE_DEPRECATION_MSG, NewtonDeprecationWarning, stacklevel=3)
-    return legacy
 
 
 class Actuator:
@@ -428,8 +428,8 @@ class Actuator:
                 :class:`InputProcessorDelay`).
             motor: Optional motor, applied after the clamping (e.g.
                 :class:`~newton.actuators.MotorDC`). With a motor, the drive
-                computes the motor command (e.g. a voltage) and receives the
-                supply voltage of each slot.
+                computes signed duty. The power stage converts duty to motor
+                voltage using actual supply voltage from the shared context.
             actuator_indices: Index of each actuator into per-actuator arrays,
                 i.e. arrays with one entry per actuator of the model rather
                 than per DOF. Required when the motor draws from a battery.
@@ -495,8 +495,6 @@ class Actuator:
         self._uses_battery = motor is not None and motor.uses_battery
         if self._uses_battery and actuator_indices is None:
             raise ValueError(f"{type(motor).__name__} draws from a battery, which requires actuator_indices")
-        if isinstance(drive, DriveVoltageControlled) and motor is None:
-            raise ValueError(f"{type(drive).__name__} requires a motor, such as MotorDC")
 
         self.device = indices.device
         self.requires_grad = requires_grad
@@ -506,11 +504,19 @@ class Actuator:
         self._applied_forces = wp.zeros(
             self.num_actuators, dtype=wp.float32, device=self.device, requires_grad=requires_grad
         )
-        self._supply_voltage = None
-        if motor is not None:
-            self._supply_voltage = wp.zeros(
-                self.num_actuators, dtype=wp.float32, device=self.device, requires_grad=requires_grad
+        self._power_stage = (
+            _PowerStageDC(
+                motor,
+                actuator_indices,
+                voltage_attr=control_supply_voltage_attr,
+                current_attr=control_supply_current_attr,
+                device=self.device,
+                count=self.num_actuators,
+                requires_grad=requires_grad,
             )
+            if motor is not None
+            else None
+        )
 
         drive.finalize(self.device, self.num_actuators)
         for processor in self.input_processors:
@@ -520,7 +526,12 @@ class Actuator:
         if motor is not None:
             motor.finalize(self.device, self.num_actuators, requires_grad=requires_grad)
 
-        self._effort_mode = _EffortModeExplicit(drive, self.clamping, self.device)
+        self._effort_mode = _EffortModeExplicit(
+            drive,
+            self.clamping,
+            self.device,
+            context=self._power_stage.context if self._power_stage is not None else None,
+        )
 
     def sim_state(self) -> Any:
         """Return an empty container with the fields this actuator reads from ``sim_state``.
@@ -695,7 +706,12 @@ class Actuator:
 
     def set_effort_mode_explicit(self) -> None:
         """Switch effort computation back to the default explicit mode."""
-        self._effort_mode = _EffortModeExplicit(self.drive, self.clamping, self.device)
+        self._effort_mode = _EffortModeExplicit(
+            self.drive,
+            self.clamping,
+            self.device,
+            context=self._power_stage.context if self._power_stage is not None else None,
+        )
 
     def is_stateful(self) -> bool:
         """Return True if an input processor or the drive maintains internal state."""
@@ -767,17 +783,15 @@ class Actuator:
            in list order (e.g. read delayed targets from ``current_state``),
            and write each processor's ``next_state`` (e.g. push the current
            targets into the delay buffer).
-        2. **Supply voltage** — with a motor, the supply voltage of each slot
-           (see :meth:`MotorDC.compute_supply_voltage
-           <newton.actuators.MotorDC.compute_supply_voltage>`), which is
-           passed to the drive and the motor.
+        2. **Physical context** — the optional power stage reads fixed or
+           battery voltage into the context shared by the drive and clamps.
         3. **Effort** — raw effort into ``_computed_forces`` (explicit control
            law, or the implicit end-of-step solve). With a motor, this is the
-           motor command (e.g. a voltage).
+           signed duty command.
         4. **Clamping** — bounded effort into ``_applied_forces``. Explicit
            clamps after the drive law; implicit enforces them inside the
            solve.
-        5. **Motor** — motor effort into ``_applied_forces``. A motor that
+        5. **Motor** — convert duty to motor voltage, then compute effort. A motor that
            draws from a battery writes the current it draws.
         6. **Scatter-add** — *accumulate* applied (and optionally computed)
            effort into the output array.  The caller must zero the output
@@ -820,7 +834,6 @@ class Actuator:
 
         target_pos = _require_array(sim_control, self.control_target_pos_attr)
         target_vel = _require_array(sim_control, self.control_target_vel_attr)
-
         feedforward = None
         if self.control_feedforward_attr is not None:
             feedforward = _get_attribute(sim_control, self.control_feedforward_attr, None)
@@ -861,15 +874,8 @@ class Actuator:
                 processor.update_state(inputs, current, nxt)
             inputs = processed
 
-        # --- 2. Supply voltage from the motor ---
-        battery_voltage = supply_current = None
-        if self._uses_battery:
-            battery_voltage = _require_array(sim_control, self.control_supply_voltage_attr)
-            supply_current = _require_array(sim_control, self.control_supply_current_attr)
-        if self.motor is not None:
-            self.motor.compute_supply_voltage(
-                battery_voltage, self.actuator_indices, self._supply_voltage, device=self.device
-            )
+        # --- 2. Shared physical context from the power stage ---
+        context = self._power_stage.prepare(sim_control) if self._power_stage is not None else None
 
         # --- 3+4. Effort mode: compute raw effort and clamp ---
         drive_state = current_act_state.drive_state if current_act_state else None
@@ -891,22 +897,12 @@ class Actuator:
             dt,
             custom_inputs,
             bias_force,
-            self._supply_voltage,
+            context,
         )
 
-        # --- 5. Motor ---
-        if self.motor is not None:
-            self.motor.compute(
-                output_forces,
-                self._applied_forces,
-                inputs.velocities,
-                inputs.vel_indices,
-                self._supply_voltage,
-                self.actuator_indices,
-                supply_current,
-                device=self.device,
-            )
-            output_forces = self._applied_forces
+        # --- 5. Power stage ---
+        if self._power_stage is not None:
+            output_forces = self._power_stage.compute(output_forces, inputs.velocities, inputs.vel_indices)
 
         # --- 6. Scatter-add to output ---
         applied_output = _require_array(sim_control, self.control_output_attr)

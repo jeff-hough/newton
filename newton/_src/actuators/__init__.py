@@ -3,7 +3,8 @@
 
 from .actuator import Actuator
 from .batteries import BatteryBase, BatteryConstantResistance
-from .clamping import ClampingBase, ClampingCurrentPWM, ClampingDCMotor, ClampingMaxEffort, ClampingPositionBased
+from .clamping import ClampingBase, ClampingCurrentDuty, ClampingDCMotor, ClampingMaxEffort, ClampingPositionBased
+from .context import ActuatorContext
 from .drives import (
     DriveBase,
     DriveNeuralGRU,
@@ -11,7 +12,6 @@ from .drives import (
     DriveNeuralMLP,
     DrivePD,
     DrivePID,
-    DriveVoltageControlled,
 )
 from .input_processors import (
     InputProcessorBase,
@@ -32,12 +32,13 @@ from .usd_parser import (
 
 __all__ = [
     "Actuator",
+    "ActuatorContext",
     "ActuatorParsed",
     "BatteryBase",
     "BatteryConstantResistance",
     "BatteryParsed",
     "ClampingBase",
-    "ClampingCurrentPWM",
+    "ClampingCurrentDuty",
     "ClampingDCMotor",
     "ClampingMaxEffort",
     "ClampingPositionBased",
@@ -48,7 +49,6 @@ __all__ = [
     "DriveNeuralMLP",
     "DrivePD",
     "DrivePID",
-    "DriveVoltageControlled",
     "InputProcessorBase",
     "InputProcessorDelay",
     "InputProcessorEncoder",

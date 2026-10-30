@@ -27,12 +27,13 @@ construction.
    :nosignatures:
 
    Actuator
+   ActuatorContext
    ActuatorParsed
    BatteryBase
    BatteryConstantResistance
    BatteryParsed
    ClampingBase
-   ClampingCurrentPWM
+   ClampingCurrentDuty
    ClampingDCMotor
    ClampingMaxEffort
    ClampingPositionBased
@@ -43,7 +44,6 @@ construction.
    DriveNeuralMLP
    DrivePD
    DrivePID
-   DriveVoltageControlled
    InputProcessorBase
    InputProcessorDelay
    InputProcessorEncoder

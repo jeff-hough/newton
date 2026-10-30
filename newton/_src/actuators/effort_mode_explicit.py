@@ -5,21 +5,43 @@
 
 from __future__ import annotations
 
+import inspect
 from typing import Any
 
 import warp as wp
 
 from .clamping.base import ClampingBase
+from .context import ActuatorContext
 from .drives.base import DriveBase
 
 
 class _EffortModeExplicit:
     """Explicit effort mode: control law at the current state, then clamps."""
 
-    def __init__(self, drive: DriveBase, clamping: list[ClampingBase], device: wp.Device):
+    def __init__(
+        self,
+        drive: DriveBase,
+        clamping: list[ClampingBase],
+        device: wp.Device,
+        *,
+        context: ActuatorContext | None = None,
+    ):
         self._drive = drive
         self._clamping = clamping
         self._device = device
+        # Select each component's input keyword at construction, not every step.
+        # Pass context only when explicitly declared: an older override may
+        # accept **kwargs but ignore context, losing its supply-voltage input.
+        self._drive_context_kwargs = self._context_kwargs(drive.compute, context)
+        self._clamp_context_kwargs = [self._context_kwargs(c.modify_forces, context) for c in clamping]
+
+    @staticmethod
+    def _context_kwargs(method, context: ActuatorContext | None) -> dict[str, Any]:
+        if context is None:
+            return {}
+        if "context" in inspect.signature(method).parameters:
+            return {"context": context}
+        return {"supply_voltage": context.supply_voltage}
 
     def is_graphable(self) -> bool:
         return self._drive.is_graphable()
@@ -42,7 +64,7 @@ class _EffortModeExplicit:
         dt: float | None,
         custom_inputs: dict[str, Any] | None = None,
         bias_force: wp.array[float] | None = None,
-        supply_voltage: wp.array[float] | None = None,
+        context: ActuatorContext | None = None,
     ) -> wp.array[float]:
         """Compute raw effort into *computed_forces*, clamp into *applied_forces*.
 
@@ -52,8 +74,7 @@ class _EffortModeExplicit:
         compute_kwargs: dict[str, Any] = {"device": self._device}
         if self._drive.custom_inputs:
             compute_kwargs["custom_inputs"] = custom_inputs
-        if supply_voltage is not None:
-            compute_kwargs["supply_voltage"] = supply_voltage
+        compute_kwargs.update(self._drive_context_kwargs)
         self._drive.compute(
             positions,
             velocities,
@@ -69,11 +90,17 @@ class _EffortModeExplicit:
             dt,
             **compute_kwargs,
         )
-        clamp_kwargs: dict[str, Any] = {"device": self._device}
-        if supply_voltage is not None:
-            clamp_kwargs["supply_voltage"] = supply_voltage
         forces = computed_forces
-        for clamp in self._clamping:
-            clamp.modify_forces(forces, applied_forces, positions, velocities, pos_indices, vel_indices, **clamp_kwargs)
+        for clamp, physical_inputs in zip(self._clamping, self._clamp_context_kwargs, strict=True):
+            clamp.modify_forces(
+                forces,
+                applied_forces,
+                positions,
+                velocities,
+                pos_indices,
+                vel_indices,
+                device=self._device,
+                **physical_inputs,
+            )
             forces = applied_forces
         return forces

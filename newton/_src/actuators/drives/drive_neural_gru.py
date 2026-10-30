@@ -14,6 +14,7 @@ import numpy as np
 import warp as wp
 
 from ...utils.onnx import require_onnx
+from ..context import ActuatorContext
 from ..utils import load_metadata
 from .base import DriveBase
 
@@ -774,6 +775,7 @@ class DriveNeuralGRU(DriveBase):
         *,
         custom_inputs: dict[str, Any] | None = None,
         supply_voltage: wp.array[float] | None = None,
+        context: ActuatorContext | None = None,
     ) -> None:
         """Evaluate one GRU sample and write physical effort."""
         self._next_hidden = None

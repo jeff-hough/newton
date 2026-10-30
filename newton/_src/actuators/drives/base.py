@@ -8,6 +8,8 @@ from typing import Any, ClassVar
 
 import warp as wp
 
+from ..context import ActuatorContext
+
 
 @wp.kernel
 def _masked_zero_1d(data: wp.array[float], mask: wp.array[wp.bool]):
@@ -23,8 +25,8 @@ class DriveBase:
     parameters, commanded inputs (targets, feedforward), and simulation
     state. The output may still be constrained by one or more
     :class:`~newton.actuators.ClampingBase` objects. In an actuator with a
-    motor, the output is the motor command instead (e.g. a voltage for
-    :class:`~newton.actuators.MotorDC`).
+    motor, the output is signed duty instead. The power stage converts duty
+    to motor voltage before evaluating :class:`~newton.actuators.MotorDC`.
 
     Subclasses must override ``compute`` and ``resolve_arguments``.
 
@@ -105,6 +107,7 @@ class DriveBase:
         *,
         custom_inputs: dict[str, Any] | None = None,
         supply_voltage: wp.array[float] | None = None,
+        context: ActuatorContext | None = None,
     ) -> None:
         """Compute actuator output effort and write to ``forces[i]``.
 
@@ -126,10 +129,12 @@ class DriveBase:
                 :attr:`custom_inputs`, keyed by attribute name. Values are
                 passed without validation and may be ``None`` when absent.
                 Empty when the drive names none.
-            supply_voltage: Supply voltage of each slot [V], from the
-                actuator's motor (see :meth:`MotorDC.compute_supply_voltage
-                <newton.actuators.MotorDC.compute_supply_voltage>`). Shape
-                ``(N,)``. Only passed when the actuator has a motor.
+            supply_voltage: Supply voltage [V], shape (N,), for standalone
+                calls. Prefer *context* in composed actuators.
+            context: Physical inputs shared by the drive and clamps for this
+                step, provided when the actuator has a power stage. Components
+                must not modify its arrays. If both arguments are supplied,
+                voltage is read from *context*, not *supply_voltage*.
         """
         raise NotImplementedError(f"{type(self).__name__} must implement compute")
 

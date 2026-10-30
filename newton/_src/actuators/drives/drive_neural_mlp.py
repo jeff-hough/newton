@@ -9,6 +9,7 @@ from typing import Any, ClassVar
 
 import warp as wp
 
+from ..context import ActuatorContext
 from ..utils import _looks_like_torch_checkpoint, _parse_metadata_scale, load_checkpoint, load_metadata
 from ._linearization import (
     IMPLICIT_JACOBIAN_MARGIN as _JACOBIAN_MARGIN,
@@ -511,6 +512,7 @@ class DriveNeuralMLP(DriveBase):
         *,
         custom_inputs: dict[str, Any] | None = None,
         supply_voltage: wp.array[float] | None = None,
+        context: ActuatorContext | None = None,
     ) -> None:
         device = device or self._device
         n = self._num_actuators
